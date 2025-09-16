@@ -84,14 +84,12 @@ def _apply_method2_tanh_inplace(emb: torch.Tensor, weights_1d: torch.Tensor) -> 
         emb[j] = base + (emb[j] - base) * w_mapped
 
 def _negpip_dual_apply(prompt_embeds: torch.Tensor, negative_prompt_embeds: torch.Tensor, alpha: float = 1.0):
-    new_prompt = prompt_embeds - alpha * negative_prompt_embeds
-    new_negative = negative_prompt_embeds + negative_prompt_embeds
-    return new_prompt, new_negative
+    return prompt_embeds - alpha * negative_prompt_embeds, negative_prompt_embeds
 
 def _negpip_dual_apply_pooled(pp: Optional[torch.Tensor], np: Optional[torch.Tensor], alpha: float = 1.0):
     if pp is None or np is None:
         return pp, np
-    return pp - alpha * np, np + np
+    return pp - alpha * np, np
 
 def get_prompts_tokens_with_weights(
     clip_tokenizer: CLIPTokenizer
