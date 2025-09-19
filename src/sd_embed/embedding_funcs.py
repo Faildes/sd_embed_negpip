@@ -382,7 +382,6 @@ def get_weighted_text_embeddings_sd15(
         
         token_embedding = pipe.text_encoder(token_tensor)[0].squeeze(0) 
         token_embedding = _apply_weights_vec_scale(token_embedding.squeeze(0), weight_tensor).unsqueeze(0)
-        token_embedding = token_embedding.unsqueeze(0)
         embeds.append(token_embedding)
         
         # get negative prompt embeddings with weights
@@ -397,7 +396,6 @@ def get_weighted_text_embeddings_sd15(
         )
         neg_token_embedding = pipe.text_encoder(neg_token_tensor)[0].squeeze(0) 
         neg_token_embedding = _apply_weights_vec_scale(neg_token_embedding.squeeze(0), neg_weight_tensor).unsqueeze(0)
-        neg_token_embedding = neg_token_embedding.unsqueeze(0)
         neg_embeds.append(neg_token_embedding)
     
     prompt_embeds       = torch.cat(embeds, dim = 1)
@@ -627,8 +625,6 @@ def get_weighted_text_embeddings_sdxl(
         prompt_embeds_list = [prompt_embeds_1_hidden_states, prompt_embeds_2_hidden_states]
         token_embedding = torch.concat(prompt_embeds_list, dim=-1).squeeze(0).to(pipe.device)
         token_embedding = _apply_weights_vec_scale(token_embedding.squeeze(0), weight_tensor).unsqueeze(0)
-
-        token_embedding = token_embedding.unsqueeze(0)
         embeds.append(token_embedding)
         
         # get negative prompt embeddings with weights
@@ -664,8 +660,6 @@ def get_weighted_text_embeddings_sdxl(
         neg_prompt_embeds_list = [neg_prompt_embeds_1_hidden_states, neg_prompt_embeds_2_hidden_states]
         neg_token_embedding = torch.concat(neg_prompt_embeds_list, dim=-1).squeeze(0).to(pipe.device)
         neg_token_embedding = _apply_weights_vec_scale(neg_token_embedding.squeeze(0), neg_weight_tensor).unsqueeze(0)
-                
-        neg_token_embedding = neg_token_embedding.unsqueeze(0)
         neg_embeds.append(neg_token_embedding)
     
     prompt_embeds           = torch.cat(embeds, dim = 1)
@@ -787,9 +781,7 @@ def get_weighted_text_embeddings_sdxl_refiner(
 
         prompt_embeds_list = [prompt_embeds_2_hidden_states]
         token_embedding = torch.concat(prompt_embeds_list, dim=-1).squeeze(0)
-        token_embedding = _apply_weights_vec_interp_to_last(token_embedding, weight_tensor_2)
-
-        token_embedding = token_embedding.unsqueeze(0)
+        token_embedding = _apply_weights_vec_interp_to_last(token_embedding, weight_tensor_2).unsqueeze(0)
         embeds.append(token_embedding)
         
         # get negative prompt embeddings with weights
@@ -813,9 +805,7 @@ def get_weighted_text_embeddings_sdxl_refiner(
 
         neg_prompt_embeds_list = [neg_prompt_embeds_2_hidden_states]
         neg_token_embedding = torch.concat(neg_prompt_embeds_list, dim=-1).squeeze(0)
-        neg_token_embedding = _apply_weights_vec_interp_to_last(neg_token_embedding, neg_weight_tensor_2)
-                
-        neg_token_embedding = neg_token_embedding.unsqueeze(0)
+        neg_token_embedding = _apply_weights_vec_interp_to_last(neg_token_embedding, neg_weight_tensor_2).unsqueeze(0)
         neg_embeds.append(neg_token_embedding)
     
     prompt_embeds           = torch.cat(embeds, dim = 1)
