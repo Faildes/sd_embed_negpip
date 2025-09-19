@@ -52,23 +52,53 @@ def _negpip_factor(w: torch.Tensor) -> torch.Tensor:
     return torch.where(w >= 0, w, 1.0 + w)
 
 def _apply_weights_vec_scale(token_embedding: torch.Tensor, weight_tensor: torch.Tensor) -> torch.Tensor:
-    """
-    token_embedding: (seq_len, hidden)
-    weight_tensor:   (seq_len,)
-    """
-    f = _negpip_factor(weight_tensor.to(dtype=token_embedding.dtype, device=token_embedding.device))
-    return token_embedding * f.unsqueeze(-1)
+    if token_embedding.dim() == 3:
+        if token_embedding.size(0) != 1:
+            raise ValueError(f"expected (1,L,H) or (L,H), got {tuple(token_embedding.shape)}")
+        E = token_embedding[0]
+    elif token_embedding.dim() == 2:
+        E = token_embedding
+    else:
+        raise ValueError(f"expected (1,L,H) or (L,H), got {tuple(token_embedding.shape)}")
+
+    w = weight_tensor
+    if not isinstance(w, torch.Tensor):
+        w = torch.as_tensor(w, device=E.device, dtype=E.dtype)
+    else:
+        w = w.to(device=E.device, dtype=E.dtype)
+
+    if w.numel() != E.size(0):
+        raise ValueError(f"weight length mismatch: {w.numel()} vs seq_len {E.size(0)}")
+
+    f = _negpip_factor(w)                    # (L,)
+    E2 = E * f.unsqueeze(-1)                 # (L,H)
+
+    return E2.unsqueeze(0)
 
 def _apply_weights_vec_interp_to_last(token_embedding: torch.Tensor, weight_tensor: torch.Tensor) -> torch.Tensor:
-    """
-        E[j] = E[-1] + (E[j]-E[-1]) * w
-    ->
-        w' = NegPiP(w) = (w if w>=0 else 1+w)
-        E = E[-1] + (E - E[-1]) * w'
-    """
-    f = _negpip_factor(weight_tensor.to(dtype=token_embedding.dtype, device=token_embedding.device))
-    anchor = token_embedding[-1:].expand_as(token_embedding)  # (seq_len, hidden)
-    return anchor + (token_embedding - anchor) * f.unsqueeze(-1)
+    if token_embedding.dim() == 3:
+        if token_embedding.size(0) != 1:
+            raise ValueError(f"expected (1,L,H) or (L,H), got {tuple(token_embedding.shape)}")
+        E = token_embedding[0]
+    elif token_embedding.dim() == 2:
+        E = token_embedding
+    else:
+        raise ValueError(f"expected (1,L,H) or (L,H), got {tuple(token_embedding.shape)}")
+
+    w = weight_tensor
+    if not isinstance(w, torch.Tensor):
+        w = torch.as_tensor(w, device=E.device, dtype=E.dtype)
+    else:
+        w = w.to(device=E.device, dtype=E.dtype)
+
+    if w.numel() != E.size(0):
+        raise ValueError(f"weight length mismatch: {w.numel()} vs seq_len {E.size(0)}")
+
+    f = _negpip_factor(w)                    # (L,)
+    anchor = E[-1].unsqueeze(0).expand_as(E) # (L,H)
+    E2 = anchor + (E - anchor) * f.unsqueeze(-1)
+
+    return E2.unsqueeze(0)
 
 def get_prompts_tokens_with_weights(
     clip_tokenizer: CLIPTokenizer
