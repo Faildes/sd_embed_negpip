@@ -61,19 +61,17 @@ def _apply_weights_vec_scale(token_embedding: torch.Tensor, weight_tensor: torch
     else:
         raise ValueError(f"expected (1,L,H) or (L,H), got {tuple(token_embedding.shape)}")
 
-    w = weight_tensor
-    if not isinstance(w, torch.Tensor):
-        w = torch.as_tensor(w, device=E.device, dtype=E.dtype)
+    if not isinstance(weight_tensor, torch.Tensor):
+        w = torch.as_tensor(weight_tensor, device=E.device, dtype=E.dtype)
     else:
-        w = w.to(device=E.device, dtype=E.dtype)
+        w = weight_tensor.to(device=E.device, dtype=E.dtype)
 
     if w.numel() != E.size(0):
         raise ValueError(f"weight length mismatch: {w.numel()} vs seq_len {E.size(0)}")
 
-    f = _negpip_factor(w)                    # (L,)
-    E2 = E * f.unsqueeze(-1)                 # (L,H)
-
-    return E2.unsqueeze(0)
+    f = _negpip_factor(w)              # (L,)
+    E2 = E * f.unsqueeze(-1)           # (L,H)
+    return E2
 
 def _apply_weights_vec_interp_to_last(token_embedding: torch.Tensor, weight_tensor: torch.Tensor) -> torch.Tensor:
     if token_embedding.dim() == 3:
@@ -85,20 +83,19 @@ def _apply_weights_vec_interp_to_last(token_embedding: torch.Tensor, weight_tens
     else:
         raise ValueError(f"expected (1,L,H) or (L,H), got {tuple(token_embedding.shape)}")
 
-    w = weight_tensor
-    if not isinstance(w, torch.Tensor):
-        w = torch.as_tensor(w, device=E.device, dtype=E.dtype)
+    if not isinstance(weight_tensor, torch.Tensor):
+        w = torch.as_tensor(weight_tensor, device=E.device, dtype=E.dtype)
     else:
-        w = w.to(device=E.device, dtype=E.dtype)
+        w = weight_tensor.to(device=E.device, dtype=E.dtype)
 
     if w.numel() != E.size(0):
         raise ValueError(f"weight length mismatch: {w.numel()} vs seq_len {E.size(0)}")
 
-    f = _negpip_factor(w)                    # (L,)
-    anchor = E[-1].unsqueeze(0).expand_as(E) # (L,H)
-    E2 = anchor + (E - anchor) * f.unsqueeze(-1)
+    f = _negpip_factor(w)                              # (L,)
+    anchor = E[-1].unsqueeze(0).expand_as(E)          # (L,H)
+    E2 = anchor + (E - anchor) * f.unsqueeze(-1)      # (L,H)
+    return E2
 
-    return E2.unsqueeze(0)
 
 def get_prompts_tokens_with_weights(
     clip_tokenizer: CLIPTokenizer
