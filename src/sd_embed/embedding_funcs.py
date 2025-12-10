@@ -188,36 +188,6 @@ def get_prompts_tokens_with_weights_t5(
         text_weights = [*text_weights, *chunk_weights]
     return text_tokens,text_weights
 
-def get_prompts_tokens_with_weights_zimage(
-    tokenizer,
-    prompt: str,
-):
-    if prompt is None or len(prompt) < 1:
-        prompt = ""
-
-    texts_and_weights = parse_prompt_attention(prompt)
-    token_ids: List[int] = []
-    weights: List[float] = []
-
-    for word, weight in texts_and_weights:
-        if not word:
-            continue
-
-        enc = tokenizer(
-            word,
-            add_special_tokens=False,
-            truncation=False,
-            return_tensors="pt",
-        )
-        ids = enc.input_ids[0].tolist()
-        if not ids:
-            continue
-
-        token_ids.extend(ids)
-        weights.extend([weight] * len(ids))
-
-    return token_ids, weights
-
 def group_tokens_and_weights(
     token_ids: list
     , weights: list
@@ -1623,6 +1593,37 @@ def get_weighted_text_embeddings_flux1(
     
     return t5_prompt_embeds,prompt_embeds
 
+def _get_zimage_prompt_tokens_and_weights(
+    tokenizer,
+    prompt: str,
+) -> Tuple[List[int], List[float]]:
+    if prompt is None or len(prompt) == 0:
+        return [], []
+
+    texts_and_weights = parse_prompt_attention(prompt)
+    token_ids: List[int] = []
+    weights: List[float] = []
+
+    for word, weight in texts_and_weights:
+        if not word:
+            continue
+
+        enc = tokenizer(
+            word,
+            add_special_tokens=False,
+            truncation=False,
+            return_tensors="pt",
+        )
+        ids = enc.input_ids[0].tolist()
+        if not ids:
+            continue
+
+        token_ids.extend(ids)
+        weights.extend([weight] * len(ids))
+
+    return token_ids, weights
+
+
 def get_weighted_text_embeddings_zimage(
     pipe: DiffusionPipeline,
     prompt: Union[str, List[str]]        = "",
@@ -1641,100 +1642,85 @@ def get_weighted_text_embeddings_zimage(
         neg_list = list(neg_prompt)
         if len(neg_list) != len(prompt_list):
             raise ValueError(
-                f"prompt と neg_prompt の数が一致していません: {len(prompt_list)} vs {len(neg_list)}"
+                f"The number of prompts and neg_prompts not matched: {len(prompt_list)} / {len(neg_list)}"
             )
 
     device = pipe.device
+    tokenizer = pipe.tokenizer
 
     dynamically_scale_lora_layers(pipe, lora_scale=lora_scale)
 
-    prompt_embeds: List[torch.Tensor] = []
-    neg_embeds: List[torch.Tensor] = []
-
-    tokenizer = pipe.tokenizer
-
-    special_prefix: List[int] = []
-    special_suffix: List[int] = []
-    try:
-        with_special = tokenizer(
-            "dummy", add_special_tokens=True, return_tensors="pt"
-        )
-        without_special = tokenizer(
-            "dummy", add_special_tokens=False, return_tensors="pt"
-        )
-        ids_with = with_special.input_ids[0].tolist()
-        ids_without = without_special.input_ids[0].tolist()
-
-        for start in range(len(ids_with) - len(ids_without) + 1):
-            if ids_with[start:start + len(ids_without)] == ids_without:
-                special_prefix = ids_with[:start]
-                special_suffix = ids_with[start + len(ids_without):]
-                break
-    except Exception:
-        special_prefix = []
-        special_suffix = []
-
     def _encode_single(text: str) -> torch.Tensor:
-        templated = text
         if hasattr(tokenizer, "apply_chat_template"):
-            messages = [
-                {"role": "user", "content": text},
-            ]
+            messages = [{"role": "user", "content": text}]
             templated = tokenizer.apply_chat_template(
                 messages,
                 tokenize=False,
                 add_generation_prompt=True,
                 enable_thinking=True,
             )
+        else:
+            templated = text
 
-        token_ids, weights = get_prompts_tokens_with_weights_zimage(
-            tokenizer, templated
+        text_inputs = tokenizer(
+            templated,
+            padding="max_length",
+            max_length=max_sequence_length,
+            truncation=True,
+            return_tensors="pt",
         )
 
-        if special_prefix or special_suffix:
-            token_ids = special_prefix + token_ids + special_suffix
-            weights = (
-                [1.0] * len(special_prefix)
-                + weights
-                + [1.0] * len(special_suffix)
-            )
-
-        if max_sequence_length is not None and len(token_ids) > max_sequence_length:
-            token_ids = token_ids[:max_sequence_length]
-            weights = weights[:max_sequence_length]
-
-        if len(token_ids) == 0:
-            pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id
-            token_ids = [pad_id]
-            weights = [1.0]
-
-        input_ids = torch.tensor(
-            [token_ids], dtype=torch.long, device=device
-        )
-        attention_mask = torch.ones_like(
-            input_ids, dtype=torch.bool, device=device
-        )
+        input_ids = text_inputs.input_ids.to(device)            # (1, max_seq_len)
+        attn_mask = text_inputs.attention_mask.to(device).bool()  # (1, max_seq_len)
 
         with torch.no_grad():
             outputs = pipe.text_encoder(
                 input_ids=input_ids,
-                attention_mask=attention_mask,
+                attention_mask=attn_mask,
                 output_hidden_states=True,
             )
-            hidden = outputs.hidden_states[-2][0]  # (L, H)
 
-        weight_tensor = torch.as_tensor(
-            weights, device=hidden.device, dtype=hidden.dtype
+        # hidden_states[-2]: (1, max_seq_len, H)
+        hidden_all = outputs.hidden_states[-2][0]      # (max_seq_len, H)
+        valid_mask = attn_mask[0]                      # (max_seq_len,)
+        full_ids = input_ids[0][valid_mask]            # (L, )
+        hidden = hidden_all[valid_mask]                # (L, H)
+
+        content_ids, content_weights = _get_zimage_prompt_tokens_and_weights(
+            tokenizer, text
         )
 
-        if hidden.size(0) != weight_tensor.numel():
-            L = min(hidden.size(0), weight_tensor.numel())
-            hidden = hidden[:L]
-            weight_tensor = weight_tensor[:L]
+        w_full = [1.0] * full_ids.numel()
+
+        if content_ids:
+            full_ids_list = full_ids.tolist()
+            cid_list = content_ids
+
+            start_idx = -1
+            max_start = len(full_ids_list) - len(cid_list)
+            for s in range(max_start + 1):
+                if full_ids_list[s:s + len(cid_list)] == cid_list:
+                    start_idx = s
+                    break
+
+            if start_idx != -1:
+                for j, wt in enumerate(content_weights):
+                    pos = start_idx + j
+                    if pos >= len(w_full):
+                        break
+                    w_full[pos] = wt
+
+        weight_tensor = torch.tensor(
+            w_full,
+            dtype=hidden.dtype,
+            device=hidden.device,
+        )
 
         hidden = _apply_weights_vec_scale(hidden, weight_tensor)
+        return hidden
 
-        return hidden  # shape: (seq_len, hidden_dim)
+    prompt_embeds: List[torch.Tensor] = []
+    neg_embeds: List[torch.Tensor] = []
 
     for p in prompt_list:
         prompt_embeds.append(_encode_single(p))
