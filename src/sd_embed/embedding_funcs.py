@@ -1628,7 +1628,7 @@ def get_weighted_text_embeddings_zimage(
     pipe: DiffusionPipeline,
     prompt: Union[str, List[str]]        = "",
     neg_prompt: Union[str, List[str]]    = "",
-    max_sequence_length: int             = 512,
+    max_sequence_length: int             = 1024,
     lora_scale: Optional[float]          = None,
 ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
     if isinstance(prompt, str):
