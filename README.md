@@ -3,6 +3,7 @@
 - [Stable Diffusion Long Prompt Weighted Embedding](#stable-diffusion-long-prompt-weighted-embedding)
   - [Updates](#updates)
   - [Install](#install)
+  - [Z-Image](#z-image)
   - [Flux.1](#flux1)
   - [Stable Diffusion 3](#stable-diffusion-3)
     - [Results](#results)
@@ -54,6 +55,68 @@ Install `sd_embed`:
 pip install git+https://github.com/xhinker/sd_embed.git@main
 ```
 
+
+## Z-Image
+
+<details>
+
+<summary>Z-Image embedding usage</summary>
+
+To use Z-Image in a low VRAM GPU, we need to quantize the QWEN text encoder model to `qfloat8` using `optimum-quanto`. see [Quanto: a PyTorch quantization backend for Optimum](https://huggingface.co/blog/quanto-introduction) and [Memory-efficient Diffusion Transformers with Quanto and Diffusers](https://huggingface.co/blog/quanto-diffusers) to convert Diffusion model weights to `qfloat8` so that we can use Z-Image in a low VRAM with Diffusers. 
+
+If you want to use All-In-One version of Z-Image (which shown on below), please use [Custom Diffusers](https://github.com/Faildes/diffusers/tree/z-image).
+
+Here is the complete usage sample:
+
+```py
+from diffusers import ZImagePipeline
+from torchao.quantization import quantize_, int8_weight_only, Float8WeightOnlyConfig
+import torch
+from transformers import TorchAoConfig as TransformersTorchAoConfig
+from sd_embed.embedding_funcs import get_weighted_text_embeddings_zimage
+
+# model_path = "SeeSee21/Z-Image-Turbo-AIO"
+model_path = "/home/andrewzhu/storage_14t_5/ai_models_all/sd_hf_models/SeeSee21/Z-Image-Turbo-AIO"
+
+pipeline_quant_config = PipelineQuantizationConfig(
+    quant_mapping={
+        "text_encoder": TransformersTorchAoConfig(Float8WeightOnlyConfig()),
+    }
+)
+
+pipe = ZImagePipeline.from_pretrained(
+    model_path
+    , quantization_config=pipeline_quant_config
+    , torch_dtype = torch.bfloat16
+)
+
+pipe.enable_model_cpu_offload()
+
+#%%
+prompt = """\
+A dreamy, soft-focus photograph capturing a romantic Jane Austen movie scene, 
+in the style of Agnes Cecile. Delicate watercolors, misty background, 
+Regency-era couple, tender embrace, period clothing, flowing dress, dappled sunlight, 
+ethereal glow, gentle expressions, intricate lace, muted pastels, serene countryside, 
+timeless romance, poetic atmosphere, wistful mood, look at camera.
+"""
+
+prompt_embeds = get_weighted_text_embeddings_zimage(
+    pipe        = pipe
+    , prompt    = prompt
+)
+image = pipe(
+    prompt_embeds               = prompt_embeds
+    , width                     = 896
+    , height                    = 1280
+    , num_inference_steps       = 20
+    , guidance_scale            = 1.0
+    , generator                 = torch.Generator().manual_seed(1234)
+).images[0]
+display(image)
+```
+
+</details>
 
 ## Flux.1
 
