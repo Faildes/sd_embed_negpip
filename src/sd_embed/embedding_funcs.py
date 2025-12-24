@@ -1712,103 +1712,6 @@ def _apply_weights_interp_mean(
 
     return anchor + (hidden - anchor) * f.unsqueeze(-1)
 
-def _split_top_level_AND(text: str) -> List[str]:
-    """Split by AND only at top-level (not inside () or [])."""
-    if not text:
-        return [""]
-
-    out: List[str] = []
-    buf: List[str] = []
-    pr = 0  # ()
-    br = 0  # []
-    i = 0
-    n = len(text)
-
-    def is_boundary(ch: str) -> bool:
-        # word boundary-ish (space or punctuation)
-        return (ch.isspace() or (not ch.isalnum() and ch != "_"))
-
-    while i < n:
-        ch = text[i]
-        if ch == "\\" and i + 1 < n:
-            buf.append(text[i])
-            buf.append(text[i + 1])
-            i += 2
-            continue
-
-        if ch == "(":
-            pr += 1
-        elif ch == ")" and pr > 0:
-            pr -= 1
-        elif ch == "[":
-            br += 1
-        elif ch == "]" and br > 0:
-            br -= 1
-
-        if pr == 0 and br == 0 and i + 3 <= n and text[i:i+3] == "AND":
-            prev = text[i-1] if i > 0 else " "
-            nxt = text[i+3] if i + 3 < n else " "
-            if is_boundary(prev) and is_boundary(nxt):
-                seg = "".join(buf).strip()
-                if seg:
-                    out.append(seg)
-                buf = []
-                i += 3
-                continue
-
-        buf.append(ch)
-        i += 1
-
-    last = "".join(buf).strip()
-    if last or not out:
-        out.append(last)
-    return out
-
-
-def _split_suffix_weight_top_level(seg: str) -> Tuple[str, float]:
-    """
-    Parse trailing ':number' only if ':' is at top-level (not inside ()/[]),
-    and the suffix is a pure float. Otherwise weight=1.0.
-    """
-    s = (seg or "").strip()
-    if not s:
-        return "", 1.0
-
-    pr = 0
-    br = 0
-    last_colon = -1
-    for i, ch in enumerate(s):
-        if ch == "\\":
-            # skip escaped next char
-            continue
-        if ch == "(":
-            pr += 1
-        elif ch == ")" and pr > 0:
-            pr -= 1
-        elif ch == "[":
-            br += 1
-        elif ch == "]" and br > 0:
-            br -= 1
-        elif ch == ":" and pr == 0 and br == 0:
-            last_colon = i
-
-    if last_colon == -1:
-        return s, 1.0
-
-    left = s[:last_colon].strip()
-    right = s[last_colon+1:].strip()
-    if not right:
-        return s, 1.0
-
-    try:
-        w = float(right)
-    except Exception:
-        return s, 1.0
-
-    if not left:
-        return s, 1.0
-    return left, w
-
 # ---------------------------
 # main (drop-in replacement)
 # ---------------------------
@@ -1853,10 +1756,120 @@ def get_weighted_text_embeddings_zimage(
         ms_ids = ms_ids[0]
     if isinstance(me_ids, list) and len(me_ids) == 1 and isinstance(me_ids[0], list):
         me_ids = me_ids[0]
+        
+    def _has_top_level_AND(text: str) -> bool:
+        if "AND" not in (text or ""):
+            return False
+        pr = br = 0
+        i = 0
+        s = text
+        n = len(s)
+        while i < n:
+            ch = s[i]
+            if ch == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if ch == "(":
+                pr += 1
+            elif ch == ")" and pr > 0:
+                pr -= 1
+            elif ch == "[":
+                br += 1
+            elif ch == "]" and br > 0:
+                br -= 1
+
+            if pr == 0 and br == 0 and i + 3 <= n and s[i:i+3] == "AND":
+                prev = s[i-1] if i > 0 else " "
+                nxt  = s[i+3] if i + 3 < n else " "
+                prev_ok = prev.isspace() or (not prev.isalnum() and prev != "_")
+                nxt_ok  = nxt.isspace()  or (not nxt.isalnum()  and nxt != "_")
+                if prev_ok and nxt_ok:
+                    return True
+            i += 1
+        return False
+
+
+    def _split_top_level_AND(text: str) -> List[str]:
+        out, buf = [], []
+        pr = br = 0
+        i = 0
+        s = text or ""
+        n = len(s)
+
+        def boundary(ch: str) -> bool:
+            return ch.isspace() or (not ch.isalnum() and ch != "_")
+
+        while i < n:
+            ch = s[i]
+            if ch == "\\" and i + 1 < n:
+                buf.append(s[i]); buf.append(s[i+1])
+                i += 2
+                continue
+
+            if ch == "(":
+                pr += 1
+            elif ch == ")" and pr > 0:
+                pr -= 1
+            elif ch == "[":
+                br += 1
+            elif ch == "]" and br > 0:
+                br -= 1
+
+            if pr == 0 and br == 0 and i + 3 <= n and s[i:i+3] == "AND":
+                prev = s[i-1] if i > 0 else " "
+                nxt  = s[i+3] if i + 3 < n else " "
+                if boundary(prev) and boundary(nxt):
+                    seg = "".join(buf).strip()
+                    if seg:
+                        out.append(seg)
+                    buf = []
+                    i += 3
+                    continue
+
+            buf.append(ch)
+            i += 1
+
+        seg = "".join(buf).strip()
+        if seg or not out:
+            out.append(seg)
+        return out
+
+
+    def _split_suffix_weight_top_level(seg: str) -> Tuple[str, float]:
+        s = (seg or "").strip()
+        if not s:
+            return "", 1.0
+        pr = br = 0
+        last_colon = -1
+        for i, ch in enumerate(s):
+            if ch == "\\":
+                continue
+            if ch == "(":
+                pr += 1
+            elif ch == ")" and pr > 0:
+                pr -= 1
+            elif ch == "[":
+                br += 1
+            elif ch == "]" and br > 0:
+                br -= 1
+            elif ch == ":" and pr == 0 and br == 0:
+                last_colon = i
+        if last_colon == -1:
+            return s, 1.0
+
+        left = s[:last_colon].strip()
+        right = s[last_colon+1:].strip()
+        try:
+            w = float(right)
+        except Exception:
+            return s, 1.0
+        if not left:
+            return s, 1.0
+        return left, w
+
 
     def _encode_single_meta(text: str):
         content_ids, content_w, clean_text = _zimage_token_weights_from_segments(tokenizer, text)
-
         user_text = f"{MARK_S}{clean_text}{MARK_E}"
 
         if hasattr(tokenizer, "apply_chat_template"):
@@ -1878,8 +1891,8 @@ def get_weighted_text_embeddings_zimage(
             return_tensors="pt",
         )
 
-        input_ids = text_inputs.input_ids.to(device)                 # (1, T)
-        attn_mask = text_inputs.attention_mask.to(device).bool()     # (1, T)
+        input_ids = text_inputs.input_ids.to(device)
+        attn_mask = text_inputs.attention_mask.to(device).bool()
 
         with torch.no_grad():
             outputs = pipe.text_encoder(
@@ -1888,13 +1901,12 @@ def get_weighted_text_embeddings_zimage(
                 output_hidden_states=True,
             )
 
-        hidden_all = outputs.hidden_states[-2][0]     # (T, H)
-        valid_mask = attn_mask[0]                     # (T,)
-        full_ids = input_ids[0][valid_mask]           # (L,)
-        hidden = hidden_all[valid_mask]               # (L, H)
+        hidden_all = outputs.hidden_states[-2][0]     # (T,H)
+        valid_mask = attn_mask[0]
+        full_ids = input_ids[0][valid_mask]
+        hidden = hidden_all[valid_mask]
 
         full_ids_list = full_ids.tolist()
-
         s_idx = _find_sublist(full_ids_list, ms_ids, start=0)
         if s_idx != -1:
             s_idx += len(ms_ids)
@@ -1917,100 +1929,69 @@ def get_weighted_text_embeddings_zimage(
             strength=weight_strength,
         )
 
-        # clamp span to valid
         s = max(0, min(int(s_idx if s_idx != -1 else 0), hidden.size(0)))
         e = max(s, min(int(e_idx), hidden.size(0)))
         return hidden, s, e
 
 
-    def _blend_content_into_base(base_hidden, base_s, base_e, parts_meta, weights, base_bias: float = 2.0):
-        """
-        base_hidden: (L,H)
-        parts_meta: list of (hidden_i, s_i, e_i)
-        weights: list of float (same length)
-        Only replace base content slice; keep template tokens untouched.
-        base_bias: keep base closer to previous behavior (bigger -> smaller change)
-        """
-        Lb = base_hidden.size(0)
-        Hb = base_hidden.size(1)
-        base_len = base_e - base_s
-        if base_len <= 0:
-            return base_hidden
+    def _resample_seq_to_len(x: torch.Tensor, L: int) -> torch.Tensor:
+        if x.size(0) == L:
+            return x
+        if x.size(0) <= 1:
+            return x.repeat(L, 1)
+        import torch.nn.functional as F
+        t = x.transpose(0, 1).unsqueeze(0)          # (1,H,S)
+        t = F.interpolate(t, size=L, mode="linear", align_corners=False)
+        return t.squeeze(0).transpose(0, 1)         # (L,H)
 
-        # collect content tensors aligned to base content length
-        contents = []
-        ws = []
 
-        # base itself (bias)
-        base_content = base_hidden[base_s:base_e]
-        contents.append(base_content)
-        ws.append(float(base_bias))
-
-        for (h, s, e), w in zip(parts_meta, weights):
-            c = h[s:e]
-            if c.size(0) <= 0:
-                continue
-
-            # align length to base_len (pad with last content vector, not template tail)
-            if c.size(0) > base_len:
-                c = c[:base_len]
-            elif c.size(0) < base_len:
-                last = c[-1:].repeat((base_len - c.size(0), 1))
-                c = torch.cat([c, last], dim=0)
-
-            contents.append(c)
-            ws.append(float(w))
-
-        if len(contents) == 1:
-            return base_hidden
-
-        # normalized weighted sum (use abs-sum for stability, keeps negative weights usable)
-        denom = sum(abs(x) for x in ws)
-        if denom == 0:
-            denom = 1.0
-
-        acc = torch.zeros((base_len, Hb), device=base_hidden.device, dtype=base_hidden.dtype)
-        for c, w in zip(contents, ws):
-            acc = acc + c * float(w)
-
-        blended = acc / float(denom)
-
-        out = base_hidden.clone()
-        out[base_s:base_e] = blended
-        return out
-    
-    def _encode_with_AND(text: str):
-        parts = _split_top_level_AND(text)
-        if len(parts) <= 1:
-            h, s, e = _encode_single_meta(text)
+    def _encode_with_AND_safe(text: str, and_strength: float = 0.6, base_bias: float = 4.0) -> torch.Tensor:
+        if not _has_top_level_AND(text):
+            h, _, _ = _encode_single_meta(text)
             return h
 
+        base_h, base_s, base_e = _encode_single_meta(text)
+        if and_strength <= 0.0 or (base_e - base_s) <= 0:
+            return base_h
+
+        parts = _split_top_level_AND(text)
         parsed = []
         for p in parts:
-            t, w = _split_suffix_weight_top_level(p)  # top-level only
+            t, w = _split_suffix_weight_top_level(p)
             t = (t or "").strip()
             if t:
                 parsed.append((t, float(w)))
-        if not parsed:
-            h, s, e = _encode_single_meta(text)
-            return h
+        if len(parsed) <= 1:
+            return base_h
 
-        # base = first
-        base_text, _ = parsed[0]
-        base_h, base_s, base_e = _encode_single_meta(base_text)
+        base_len = base_e - base_s
+        base_content = base_h[base_s:base_e]
 
-        # others
-        others = []
-        ws = []
-        for t, w in parsed[1:]:
-            h, s, e = _encode_single_meta(t)
-            others.append((h, s, e))
-            ws.append(w)
+        contents = [base_content]
+        weights  = [float(base_bias)]
 
-        return _blend_content_into_base(base_h, base_s, base_e, others, ws, base_bias=2.0)
+        for t, w in parsed:
+            hi, si, ei = _encode_single_meta(t)
+            ci = hi[si:ei]
+            if ci.numel() == 0:
+                continue
+            ci = _resample_seq_to_len(ci, base_len)
+            contents.append(ci)
+            weights.append(float(w))
 
-    prompt_embeds: List[torch.Tensor] = [_encode_with_AND(p) for p in prompt_list]
-    neg_embeds: List[torch.Tensor] = [_encode_with_AND(n) for n in neg_list]
+        denom = sum(abs(w) for w in weights) or 1.0
+        mixed = torch.zeros_like(base_content)
+        for c, w in zip(contents, weights):
+            mixed = mixed + c * float(w)
+        mixed = mixed / float(denom)
+
+        mod = base_h.clone()
+        mod[base_s:base_e] = mixed
+
+        return base_h + (mod - base_h) * float(and_strength)
+
+    prompt_embeds: List[torch.Tensor] = [_encode_with_AND_safe(p, and_strength=0.6, base_bias=4.0) for p in prompt_list]
+    neg_embeds: List[torch.Tensor]    = [_encode_with_AND_safe(n, and_strength=0.6, base_bias=4.0) for n in neg_list]
 
     dynamically_unscale_lora_layers(pipe, lora_scale=lora_scale)
     return prompt_embeds, neg_embeds
