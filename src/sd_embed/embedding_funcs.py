@@ -1995,3 +1995,282 @@ def get_weighted_text_embeddings_zimage(
 
     dynamically_unscale_lora_layers(pipe, lora_scale=lora_scale)
     return prompt_embeds, neg_embeds
+
+# ============================================================
+# Anima (AM) embeddings
+# ============================================================
+
+def _has_top_level_AND(text: str) -> bool:
+    if "AND" not in (text or ""):
+        return False
+    pr = br = 0
+    i = 0
+    s = text
+    n = len(s)
+    while i < n:
+        ch = s[i]
+        if ch == "\\" and i + 1 < n:
+            i += 2
+            continue
+        if ch == "(":
+            pr += 1
+        elif ch == ")" and pr > 0:
+            pr -= 1
+        elif ch == "[":
+            br += 1
+        elif ch == "]" and br > 0:
+            br -= 1
+
+        if pr == 0 and br == 0 and i + 3 <= n and s[i:i+3] == "AND":
+            prev = s[i-1] if i > 0 else " "
+            nxt  = s[i+3] if i + 3 < n else " "
+            prev_ok = prev.isspace() or (not prev.isalnum() and prev != "_")
+            nxt_ok  = nxt.isspace()  or (not nxt.isalnum()  and nxt != "_")
+            if prev_ok and nxt_ok:
+                return True
+        i += 1
+    return False
+
+
+def _split_top_level_AND(text: str) -> List[str]:
+    out, buf = [], []
+    pr = br = 0
+    i = 0
+    s = text or ""
+    n = len(s)
+
+    def boundary(ch: str) -> bool:
+        return ch.isspace() or (not ch.isalnum() and ch != "_")
+
+    while i < n:
+        ch = s[i]
+        if ch == "\\" and i + 1 < n:
+            buf.append(s[i]); buf.append(s[i+1])
+            i += 2
+            continue
+
+        if ch == "(":
+            pr += 1
+        elif ch == ")" and pr > 0:
+            pr -= 1
+        elif ch == "[":
+            br += 1
+        elif ch == "]" and br > 0:
+            br -= 1
+
+        if pr == 0 and br == 0 and i + 3 <= n and s[i:i+3] == "AND":
+            prev = s[i-1] if i > 0 else " "
+            nxt  = s[i+3] if i + 3 < n else " "
+            if boundary(prev) and boundary(nxt):
+                seg = "".join(buf).strip()
+                if seg:
+                    out.append(seg)
+                buf = []
+                i += 3
+                continue
+
+        buf.append(ch)
+        i += 1
+
+    seg = "".join(buf).strip()
+    if seg or not out:
+        out.append(seg)
+    return out
+
+
+def _split_suffix_weight_top_level(seg: str) -> Tuple[str, float]:
+    s = (seg or "").strip()
+    if not s:
+        return "", 1.0
+    pr = br = 0
+    last_colon = -1
+    for i, ch in enumerate(s):
+        if ch == "\\":
+            continue
+        if ch == "(":
+            pr += 1
+        elif ch == ")" and pr > 0:
+            pr -= 1
+        elif ch == "[":
+            br += 1
+        elif ch == "]" and br > 0:
+            br -= 1
+        elif ch == ":" and pr == 0 and br == 0:
+            last_colon = i
+
+    if last_colon == -1:
+        return s, 1.0
+
+    left = s[:last_colon].strip()
+    right = s[last_colon+1:].strip()
+    try:
+        w = float(right)
+    except Exception:
+        return s, 1.0
+    if not left:
+        return s, 1.0
+    return left, w
+
+
+@torch.no_grad()
+def _anima_encode_cond_only(
+    pipe,
+    text: str,
+    *,
+    num_images_per_prompt: int = 1,
+) -> torch.Tensor:
+    pos_cond, _ = pipe.encode_prompt(
+        prompt=text,
+        negative_prompt="",
+        num_images_per_prompt=int(num_images_per_prompt),
+    )
+    return pos_cond
+
+
+def _pick_weighted_segments_for_mix(
+    segs: List[Tuple[str, float]],
+    *,
+    max_segments: int = 12,
+    min_len: int = 2,
+) -> List[Tuple[str, float]]:
+    cand = []
+    for t, w in segs:
+        tt = (t or "").strip()
+        if not tt or len(tt) < min_len:
+            continue
+        ww = float(w)
+        if abs(ww - 1.0) < 1e-6:
+            continue
+        score = abs(ww - 1.0) * max(1, len(tt))
+        cand.append((score, tt, ww))
+
+    if not cand:
+        return []
+
+    cand.sort(key=lambda x: x[0], reverse=True)
+    cand = cand[:max_segments]
+    return [(t, w) for _, t, w in cand]
+
+
+@torch.no_grad()
+def _mix_weighted_cond_anima(
+    pipe,
+    text: str,
+    *,
+    num_images_per_prompt: int = 1,
+    and_strength: float = 0.60,
+    base_bias: float = 4.0,
+    max_segments: int = 12,
+) -> torch.Tensor:
+    clean, segs = _strip_attention_syntax(text)
+
+    # base
+    base = _anima_encode_cond_only(pipe, clean, num_images_per_prompt=num_images_per_prompt)
+
+    picked = _pick_weighted_segments_for_mix(segs, max_segments=max_segments)
+    if not picked:
+        return base
+
+    # weighted mix
+    mixed = base * float(base_bias)
+    denom = abs(float(base_bias)) + 1e-6
+
+    for seg_text, w in picked:
+        cond_i = _anima_encode_cond_only(pipe, seg_text, num_images_per_prompt=num_images_per_prompt)
+
+        # NegPiP
+        wf = float(w) if float(w) >= 0.0 else (1.0 + float(w))
+        wf = float(max(-2.0, min(3.0, wf)))
+
+        mixed = mixed + cond_i * wf
+        denom = denom + abs(wf)
+
+    mixed = mixed / denom
+    return base + (mixed - base) * float(and_strength)
+
+
+@torch.no_grad()
+def get_weighted_text_embeddings_anima(
+    pipe,
+    prompt: Union[str, List[str]] = "",
+    neg_prompt: Union[str, List[str]] = "",
+    *,
+    num_images_per_prompt: int = 1,
+    lora_scale: Optional[float] = None,
+    and_strength: float = 0.60,
+    base_bias: float = 4.0,
+    enable_AND: bool = True,
+    max_segments: int = 12,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    dynamically_scale_lora_layers(pipe, lora_scale=lora_scale)
+
+    # normalize to list
+    if isinstance(prompt, str):
+        prompt_list = [prompt]
+    else:
+        prompt_list = list(prompt)
+
+    if isinstance(neg_prompt, str):
+        neg_list = [neg_prompt] * len(prompt_list)
+    else:
+        neg_list = list(neg_prompt)
+        if len(neg_list) != len(prompt_list):
+            raise ValueError(f"The number of prompts and neg_prompts not matched: {len(prompt_list)} / {len(neg_list)}")
+
+    def _encode_text(text: str) -> torch.Tensor:
+        text = text or ""
+        if enable_AND and _has_top_level_AND(text):
+            parts = _split_top_level_AND(text)
+            parsed = []
+            for p in parts:
+                t, w = _split_suffix_weight_top_level(p)
+                t = (t or "").strip()
+                if t:
+                    parsed.append((t, float(w)))
+
+            base = _mix_weighted_cond_anima(
+                pipe, text,
+                num_images_per_prompt=num_images_per_prompt,
+                and_strength=0.0,
+                base_bias=base_bias,
+                max_segments=max_segments,
+            )
+            if len(parsed) <= 1:
+                return base
+
+            mixed = base * float(base_bias)
+            denom = abs(float(base_bias)) + 1e-6
+            for t, w in parsed:
+                ci = _mix_weighted_cond_anima(
+                    pipe, t,
+                    num_images_per_prompt=num_images_per_prompt,
+                    and_strength=0.0,
+                    base_bias=base_bias,
+                    max_segments=max_segments,
+                )
+                wf = float(w) if float(w) >= 0.0 else (1.0 + float(w))
+                wf = float(max(-2.0, min(3.0, wf)))
+                mixed = mixed + ci * wf
+                denom = denom + abs(wf)
+            mixed = mixed / denom
+            return base + (mixed - base) * float(and_strength)
+
+        return _mix_weighted_cond_anima(
+            pipe, text,
+            num_images_per_prompt=num_images_per_prompt,
+            and_strength=and_strength,
+            base_bias=base_bias,
+            max_segments=max_segments,
+        )
+
+    pos_list = []
+    neg_list_out = []
+    for p, n in zip(prompt_list, neg_list):
+        pos_list.append(_encode_text(p))
+        neg_list_out.append(_encode_text(n))
+
+    prompt_embeds = torch.cat(pos_list, dim=0)
+    negative_prompt_embeds = torch.cat(neg_list_out, dim=0)
+
+    dynamically_unscale_lora_layers(pipe, lora_scale=lora_scale)
+    return prompt_embeds, negative_prompt_embeds
