@@ -2000,193 +2000,303 @@ def get_weighted_text_embeddings_zimage(
 # Anima (AM) embeddings
 # ============================================================
 
-def _has_top_level_AND(text: str) -> bool:
-    if "AND" not in (text or ""):
-        return False
-    pr = br = 0
-    i = 0
-    s = text
-    n = len(s)
-    while i < n:
-        ch = s[i]
-        if ch == "\\" and i + 1 < n:
-            i += 2
-            continue
-        if ch == "(":
-            pr += 1
-        elif ch == ")" and pr > 0:
-            pr -= 1
-        elif ch == "[":
-            br += 1
-        elif ch == "]" and br > 0:
-            br -= 1
 
-        if pr == 0 and br == 0 and i + 3 <= n and s[i:i+3] == "AND":
-            prev = s[i-1] if i > 0 else " "
-            nxt  = s[i+3] if i + 3 < n else " "
-            prev_ok = prev.isspace() or (not prev.isalnum() and prev != "_")
-            nxt_ok  = nxt.isspace()  or (not nxt.isalnum()  and nxt != "_")
-            if prev_ok and nxt_ok:
-                return True
-        i += 1
-    return False
+def _flatten_tokenizer_output_ids(ids):
+    if isinstance(ids, torch.Tensor):
+        ids = ids.detach().cpu().tolist()
+    if isinstance(ids, list) and len(ids) == 1 and isinstance(ids[0], list):
+        ids = ids[0]
+    return list(ids)
 
 
-def _split_top_level_AND(text: str) -> List[str]:
-    out, buf = [], []
-    pr = br = 0
-    i = 0
-    s = text or ""
-    n = len(s)
+def _flatten_offsets(offsets):
+    if offsets is None:
+        return None
+    if isinstance(offsets, torch.Tensor):
+        offsets = offsets.detach().cpu().tolist()
+    if isinstance(offsets, list) and len(offsets) == 1 and isinstance(offsets[0], list):
+        offsets = offsets[0]
+    return [tuple(x) for x in offsets]
 
-    def boundary(ch: str) -> bool:
-        return ch.isspace() or (not ch.isalnum() and ch != "_")
 
-    while i < n:
-        ch = s[i]
-        if ch == "\\" and i + 1 < n:
-            buf.append(s[i]); buf.append(s[i+1])
-            i += 2
-            continue
+def _segments_to_char_spans(segs: List[Tuple[str, float]]) -> List[Tuple[int, int, float]]:
+    spans: List[Tuple[int, int, float]] = []
+    pos = 0
+    for t, w in segs:
+        t = t or ""
+        n = len(t)
+        if n > 0:
+            spans.append((pos, pos + n, float(w)))
+        pos += n
+    return spans
 
-        if ch == "(":
-            pr += 1
-        elif ch == ")" and pr > 0:
-            pr -= 1
-        elif ch == "[":
-            br += 1
-        elif ch == "]" and br > 0:
-            br -= 1
 
-        if pr == 0 and br == 0 and i + 3 <= n and s[i:i+3] == "AND":
-            prev = s[i-1] if i > 0 else " "
-            nxt  = s[i+3] if i + 3 < n else " "
-            if boundary(prev) and boundary(nxt):
-                seg = "".join(buf).strip()
-                if seg:
-                    out.append(seg)
-                buf = []
-                i += 3
+def _weight_for_char_span(spans: List[Tuple[int, int, float]], start: int, end: int) -> float:
+    if end <= start:
+        return 1.0
+    total = 0
+    acc = 0.0
+    for s0, s1, w in spans:
+        ov = max(0, min(end, s1) - max(start, s0))
+        if ov > 0:
+            acc += float(w) * ov
+            total += ov
+    return acc / total if total > 0 else 1.0
+
+
+def _token_weights_from_offsets(tokenizer, text: str, *, max_sequence_length: int) -> Tuple[List[int], List[float], List[int], str]:
+    """Return token ids, per-token weights, attention mask, and clean text.
+
+    This keeps A1111/ComfyUI-style prompt syntax out of the LLM prompt while
+    preserving the weight value on the tokenizer positions that correspond to
+    the cleaned text.
+    """
+    clean_text, segs = _strip_attention_syntax(text or "")
+    spans = _segments_to_char_spans(segs)
+
+    try:
+        enc = tokenizer(
+            clean_text,
+            padding="max_length",
+            truncation=True,
+            max_length=int(max_sequence_length),
+            return_tensors=None,
+            return_offsets_mapping=True,
+        )
+        ids = _flatten_tokenizer_output_ids(enc.input_ids if hasattr(enc, "input_ids") else enc["input_ids"])
+        offsets = _flatten_offsets(enc.offset_mapping if hasattr(enc, "offset_mapping") else enc.get("offset_mapping"))
+        attn = enc.attention_mask if hasattr(enc, "attention_mask") else enc.get("attention_mask", [1] * len(ids))
+        if isinstance(attn, torch.Tensor):
+            attn = attn.detach().cpu().tolist()
+        if isinstance(attn, list) and len(attn) == 1 and isinstance(attn[0], list):
+            attn = attn[0]
+
+        weights: List[float] = []
+        for i, off in enumerate(offsets or []):
+            # Special/padding tokens generally use (0, 0). Keep them neutral.
+            if i >= len(attn) or int(attn[i]) == 0 or off is None or len(off) != 2:
+                weights.append(1.0)
                 continue
+            s, e = int(off[0]), int(off[1])
+            weights.append(_weight_for_char_span(spans, s, e) if e > s else 1.0)
+        if len(weights) == len(ids):
+            return ids, weights, [int(x) for x in attn], clean_text
+    except Exception:
+        pass
 
-        buf.append(ch)
-        i += 1
+    # Fallback for slow tokenizers without offsets.
+    ids_no_special, weights_no_special, clean_text = _zimage_token_weights_from_segments(tokenizer, text or "")
+    enc = tokenizer(
+        clean_text,
+        padding="max_length",
+        truncation=True,
+        max_length=int(max_sequence_length),
+        return_tensors=None,
+    )
+    ids = _flatten_tokenizer_output_ids(enc.input_ids if hasattr(enc, "input_ids") else enc["input_ids"])
+    attn = enc.attention_mask if hasattr(enc, "attention_mask") else enc.get("attention_mask", [1] * len(ids))
+    if isinstance(attn, torch.Tensor):
+        attn = attn.detach().cpu().tolist()
+    if isinstance(attn, list) and len(attn) == 1 and isinstance(attn[0], list):
+        attn = attn[0]
 
-    seg = "".join(buf).strip()
-    if seg or not out:
-        out.append(seg)
+    # Try to locate the no-special sequence inside the actual encoded sequence.
+    start = _find_sublist(ids, ids_no_special, start=0)
+    weights = [1.0] * len(ids)
+    if start >= 0:
+        n = min(len(weights_no_special), len(weights) - start)
+        for i in range(n):
+            weights[start + i] = float(weights_no_special[i])
+    return ids, weights, [int(x) for x in attn], clean_text
+
+
+def _make_weight_factor(
+    weights: torch.Tensor,
+    *,
+    strength: float = 1.0,
+    clamp_min: float = 0.0,
+    clamp_max: float = 3.0,
+) -> torch.Tensor:
+    f = _negpip_factor(weights)
+    f = 1.0 + (f - 1.0) * float(strength)
+    if clamp_min is not None or clamp_max is not None:
+        f = f.clamp(
+            min=clamp_min if clamp_min is not None else -float("inf"),
+            max=clamp_max if clamp_max is not None else float("inf"),
+        )
+    return f
+
+
+def _apply_weights_comfy_anchor(
+    hidden: torch.Tensor,
+    empty_hidden: torch.Tensor,
+    weights: torch.Tensor,
+    *,
+    strength: float = 1.0,
+    clamp_min: float = 0.0,
+    clamp_max: float = 3.0,
+) -> torch.Tensor:
+    """ComfyUI-style weighting: empty + (cond - empty) * weight.
+
+    ComfyUI applies prompt weights relative to an empty conditioning vector,
+    which is much more stable than raw multiplication for normalized encoders.
+    """
+    if hidden.dim() == 2:
+        hidden = hidden.unsqueeze(0)
+    if empty_hidden.dim() == 2:
+        empty_hidden = empty_hidden.unsqueeze(0)
+    if weights.dim() == 1:
+        weights = weights.unsqueeze(0)
+
+    T = min(hidden.shape[1], empty_hidden.shape[1], weights.shape[1])
+    out = hidden.clone()
+    f = _make_weight_factor(
+        weights[:, :T].to(device=hidden.device, dtype=hidden.dtype),
+        strength=strength,
+        clamp_min=clamp_min,
+        clamp_max=clamp_max,
+    ).unsqueeze(-1)
+    out[:, :T] = empty_hidden[:, :T].to(device=hidden.device, dtype=hidden.dtype) + (
+        hidden[:, :T] - empty_hidden[:, :T].to(device=hidden.device, dtype=hidden.dtype)
+    ) * f
     return out
 
 
-def _split_suffix_weight_top_level(seg: str) -> Tuple[str, float]:
-    s = (seg or "").strip()
-    if not s:
-        return "", 1.0
-    pr = br = 0
-    last_colon = -1
-    for i, ch in enumerate(s):
-        if ch == "\\":
-            continue
-        if ch == "(":
-            pr += 1
-        elif ch == ")" and pr > 0:
-            pr -= 1
-        elif ch == "[":
-            br += 1
-        elif ch == "]" and br > 0:
-            br -= 1
-        elif ch == ":" and pr == 0 and br == 0:
-            last_colon = i
-
-    if last_colon == -1:
-        return s, 1.0
-
-    left = s[:last_colon].strip()
-    right = s[last_colon+1:].strip()
-    try:
-        w = float(right)
-    except Exception:
-        return s, 1.0
-    if not left:
-        return s, 1.0
-    return left, w
+def _pad_or_crop_anima_embeds(x: torch.Tensor, length: int = 512) -> torch.Tensor:
+    if x.shape[1] < length:
+        x = torch.nn.functional.pad(x, (0, 0, 0, int(length) - x.shape[1]))
+    elif x.shape[1] > length:
+        x = x[:, :int(length), :]
+    return x
 
 
 @torch.no_grad()
-def _anima_encode_cond_only(
+def _encode_anima_weighted_single(
     pipe,
     text: str,
     *,
     num_images_per_prompt: int = 1,
+    max_sequence_length: int = 512,
+    qwen_weight_strength: float = 1.25,
+    adapter_weight_strength: float = 1.75,
+    weight_clamp_min: float = 0.0,
+    weight_clamp_max: float = 3.0,
 ) -> torch.Tensor:
-    pos_cond, _ = pipe.encode_prompt(
-        prompt=text,
-        negative_prompt="",
-        num_images_per_prompt=int(num_images_per_prompt),
+    device = pipe._execution_device if hasattr(pipe, "_execution_device") else pipe.device
+    dtype = getattr(getattr(pipe, "text_encoder", None), "dtype", torch.float16)
+    llm_adapter = getattr(pipe, "llm_adapter", None)
+    adapter_config = getattr(llm_adapter, "config", None)
+    target_dim = int(getattr(adapter_config, "target_dim", 1024))
+
+    text = text or ""
+    clean_text, _ = _strip_attention_syntax(text)
+    if clean_text.strip() == "":
+        return torch.zeros(
+            int(num_images_per_prompt),
+            512,
+            target_dim,
+            device=device,
+            dtype=dtype,
+        )
+
+    qwen_ids, qwen_weights, qwen_mask, _ = _token_weights_from_offsets(
+        pipe.tokenizer,
+        text,
+        max_sequence_length=max_sequence_length,
     )
-    return pos_cond
+    t5_tokenizer = getattr(pipe, "t5_tokenizer", None)
+    if t5_tokenizer is None:
+        # Extremely defensive fallback; Anima diffusers normally has t5_tokenizer.
+        t5_tokenizer = pipe.tokenizer
+    t5_ids, t5_weights, _t5_mask, _ = _token_weights_from_offsets(
+        t5_tokenizer,
+        text,
+        max_sequence_length=max_sequence_length,
+    )
 
+    qwen_input_ids = torch.tensor([qwen_ids], dtype=torch.long, device=device)
+    qwen_attention_mask = torch.tensor([qwen_mask], dtype=torch.long, device=device)
+    qwen_weight_tensor = torch.tensor([qwen_weights], dtype=dtype, device=device)
+    t5_input_ids = torch.tensor([t5_ids], dtype=torch.long, device=device)
+    t5_weight_tensor = torch.tensor([t5_weights], dtype=dtype, device=device)
 
-def _pick_weighted_segments_for_mix(
-    segs: List[Tuple[str, float]],
-    *,
-    max_segments: int = 12,
-    min_len: int = 2,
-) -> List[Tuple[str, float]]:
-    cand = []
-    for t, w in segs:
-        tt = (t or "").strip()
-        if not tt or len(tt) < min_len:
-            continue
-        ww = float(w)
-        if abs(ww - 1.0) < 1e-6:
-            continue
-        score = abs(ww - 1.0) * max(1, len(tt))
-        cand.append((score, tt, ww))
+    # Empty anchors for ComfyUI-style weighting. Cache per pipe/device/dtype/length to avoid a second
+    # encoder pass for every prompt after the first call.
+    cache = getattr(pipe, "_sd_embed_anima_empty_cache", None)
+    cache_key = (str(device), str(dtype), int(max_sequence_length))
+    if cache is None:
+        cache = {}
+        setattr(pipe, "_sd_embed_anima_empty_cache", cache)
 
-    if not cand:
-        return []
+    if cache_key not in cache:
+        empty_qwen = pipe.tokenizer(
+            "",
+            padding="max_length",
+            truncation=True,
+            max_length=int(max_sequence_length),
+            return_tensors="pt",
+        )
+        empty_t5 = t5_tokenizer(
+            "",
+            padding="max_length",
+            truncation=True,
+            max_length=int(max_sequence_length),
+            return_tensors="pt",
+        )
+        empty_qwen_ids = empty_qwen.input_ids.to(device)
+        empty_qwen_mask = empty_qwen.attention_mask.to(device)
+        empty_t5_ids = empty_t5.input_ids.to(device)
 
-    cand.sort(key=lambda x: x[0], reverse=True)
-    cand = cand[:max_segments]
-    return [(t, w) for _, t, w in cand]
+        empty_qwen_out = pipe.text_encoder(
+            input_ids=empty_qwen_ids,
+            attention_mask=empty_qwen_mask,
+        )
+        empty_qwen_hidden = empty_qwen_out.last_hidden_state.to(dtype=dtype)
+        empty_adapted = pipe.llm_adapter(
+            source_hidden_states=empty_qwen_hidden,
+            target_input_ids=empty_t5_ids,
+        ).to(dtype=dtype)
+        empty_adapted = _pad_or_crop_anima_embeds(empty_adapted, 512)
+        cache[cache_key] = (
+            empty_qwen_hidden.detach(),
+            empty_adapted.detach(),
+        )
 
+    empty_qwen_hidden, empty_adapted = cache[cache_key]
 
-@torch.no_grad()
-def _mix_weighted_cond_anima(
-    pipe,
-    text: str,
-    *,
-    num_images_per_prompt: int = 1,
-    and_strength: float = 0.60,
-    base_bias: float = 4.0,
-    max_segments: int = 12,
-) -> torch.Tensor:
-    clean, segs = _strip_attention_syntax(text)
+    # 1) Weight Qwen hidden states before the LLM adapter.
+    qwen_outputs = pipe.text_encoder(
+        input_ids=qwen_input_ids,
+        attention_mask=qwen_attention_mask,
+    )
+    qwen_hidden = qwen_outputs.last_hidden_state.to(dtype=dtype)
+    qwen_hidden = _apply_weights_comfy_anchor(
+        qwen_hidden,
+        empty_qwen_hidden,
+        qwen_weight_tensor,
+        strength=qwen_weight_strength,
+        clamp_min=weight_clamp_min,
+        clamp_max=weight_clamp_max,
+    )
 
-    # base
-    base = _anima_encode_cond_only(pipe, clean, num_images_per_prompt=num_images_per_prompt)
+    # 2) Run Anima's adapter, then weight the T5-target token embeddings too.
+    adapted = pipe.llm_adapter(
+        source_hidden_states=qwen_hidden,
+        target_input_ids=t5_input_ids,
+    ).to(dtype=dtype)
+    adapted = _pad_or_crop_anima_embeds(adapted, 512)
+    adapted = _apply_weights_comfy_anchor(
+        adapted,
+        empty_adapted,
+        t5_weight_tensor,
+        strength=adapter_weight_strength,
+        clamp_min=weight_clamp_min,
+        clamp_max=weight_clamp_max,
+    )
 
-    picked = _pick_weighted_segments_for_mix(segs, max_segments=max_segments)
-    if not picked:
-        return base
-
-    # weighted mix
-    mixed = base * float(base_bias)
-    denom = abs(float(base_bias)) + 1e-6
-
-    for seg_text, w in picked:
-        cond_i = _anima_encode_cond_only(pipe, seg_text, num_images_per_prompt=num_images_per_prompt)
-
-        # NegPiP
-        wf = float(w) if float(w) >= 0.0 else (1.0 + float(w))
-        wf = float(max(-2.0, min(3.0, wf)))
-
-        mixed = mixed + cond_i * wf
-        denom = denom + abs(wf)
-
-    mixed = mixed / denom
-    return base + (mixed - base) * float(and_strength)
+    if int(num_images_per_prompt) > 1:
+        adapted = adapted.repeat_interleave(int(num_images_per_prompt), dim=0)
+    return adapted
 
 
 @torch.no_grad()
@@ -2196,81 +2306,70 @@ def get_weighted_text_embeddings_anima(
     neg_prompt: Union[str, List[str]] = "",
     *,
     num_images_per_prompt: int = 1,
+    max_sequence_length: int = 512,
     lora_scale: Optional[float] = None,
-    and_strength: float = 0.60,
-    base_bias: float = 4.0,
-    enable_AND: bool = True,
-    max_segments: int = 12,
+    qwen_weight_strength: float = 1.25,
+    adapter_weight_strength: float = 1.75,
+    weight_clamp_min: float = 0.0,
+    weight_clamp_max: float = 3.0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Weighted embeddings for Anima.
+
+    Supports normal sd_embed/A1111/ComfyUI-style syntax such as:
+      - (word)        -> 1.1x from parse_prompt_attention
+      - [word]        -> 1/1.1x from parse_prompt_attention
+      - (word:1.35)   -> explicit weight
+      - escaped \( \) \[ \]
+
+    Unlike the previous Anima implementation, this does not average separately
+    encoded sub-prompts. It removes the syntax from the text sent to Qwen/T5,
+    maps weights onto tokenizer offsets, and applies the weights directly to
+    Qwen hidden states plus the adapter output using ComfyUI's anchored formula.
+    """
     dynamically_scale_lora_layers(pipe, lora_scale=lora_scale)
 
-    # normalize to list
-    if isinstance(prompt, str):
-        prompt_list = [prompt]
-    else:
-        prompt_list = list(prompt)
+    try:
+        if isinstance(prompt, str):
+            prompt_list = [prompt]
+        else:
+            prompt_list = list(prompt)
 
-    if isinstance(neg_prompt, str):
-        neg_list = [neg_prompt] * len(prompt_list)
-    else:
-        neg_list = list(neg_prompt)
-        if len(neg_list) != len(prompt_list):
-            raise ValueError(f"The number of prompts and neg_prompts not matched: {len(prompt_list)} / {len(neg_list)}")
-
-    def _encode_text(text: str) -> torch.Tensor:
-        text = text or ""
-        if enable_AND and _has_top_level_AND(text):
-            parts = _split_top_level_AND(text)
-            parsed = []
-            for p in parts:
-                t, w = _split_suffix_weight_top_level(p)
-                t = (t or "").strip()
-                if t:
-                    parsed.append((t, float(w)))
-
-            base = _mix_weighted_cond_anima(
-                pipe, text,
-                num_images_per_prompt=num_images_per_prompt,
-                and_strength=0.0,
-                base_bias=base_bias,
-                max_segments=max_segments,
-            )
-            if len(parsed) <= 1:
-                return base
-
-            mixed = base * float(base_bias)
-            denom = abs(float(base_bias)) + 1e-6
-            for t, w in parsed:
-                ci = _mix_weighted_cond_anima(
-                    pipe, t,
-                    num_images_per_prompt=num_images_per_prompt,
-                    and_strength=0.0,
-                    base_bias=base_bias,
-                    max_segments=max_segments,
+        if isinstance(neg_prompt, str):
+            neg_list = [neg_prompt] * len(prompt_list)
+        else:
+            neg_list = list(neg_prompt)
+            if len(neg_list) != len(prompt_list):
+                raise ValueError(
+                    f"The number of prompts and neg_prompts not matched: {len(prompt_list)} / {len(neg_list)}"
                 )
-                wf = float(w) if float(w) >= 0.0 else (1.0 + float(w))
-                wf = float(max(-2.0, min(3.0, wf)))
-                mixed = mixed + ci * wf
-                denom = denom + abs(wf)
-            mixed = mixed / denom
-            return base + (mixed - base) * float(and_strength)
 
-        return _mix_weighted_cond_anima(
-            pipe, text,
-            num_images_per_prompt=num_images_per_prompt,
-            and_strength=and_strength,
-            base_bias=base_bias,
-            max_segments=max_segments,
-        )
+        pos_list = [
+            _encode_anima_weighted_single(
+                pipe,
+                p,
+                num_images_per_prompt=num_images_per_prompt,
+                max_sequence_length=max_sequence_length,
+                qwen_weight_strength=qwen_weight_strength,
+                adapter_weight_strength=adapter_weight_strength,
+                weight_clamp_min=weight_clamp_min,
+                weight_clamp_max=weight_clamp_max,
+            )
+            for p in prompt_list
+        ]
+        neg_list_out = [
+            _encode_anima_weighted_single(
+                pipe,
+                n,
+                num_images_per_prompt=num_images_per_prompt,
+                max_sequence_length=max_sequence_length,
+                qwen_weight_strength=qwen_weight_strength,
+                adapter_weight_strength=adapter_weight_strength,
+                weight_clamp_min=weight_clamp_min,
+                weight_clamp_max=weight_clamp_max,
+            )
+            for n in neg_list
+        ]
 
-    pos_list = []
-    neg_list_out = []
-    for p, n in zip(prompt_list, neg_list):
-        pos_list.append(_encode_text(p))
-        neg_list_out.append(_encode_text(n))
-
-    prompt_embeds = torch.cat(pos_list, dim=0)
-    negative_prompt_embeds = torch.cat(neg_list_out, dim=0)
-
-    dynamically_unscale_lora_layers(pipe, lora_scale=lora_scale)
-    return prompt_embeds, negative_prompt_embeds
+        return torch.cat(pos_list, dim=0), torch.cat(neg_list_out, dim=0)
+    finally:
+        dynamically_unscale_lora_layers(pipe, lora_scale=lora_scale)
