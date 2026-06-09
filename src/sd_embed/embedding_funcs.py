@@ -3329,3 +3329,362 @@ def get_weighted_text_embeddings_anima(
         return pos, neg
     finally:
         dynamically_unscale_lora_layers(pipe, lora_scale=lora_scale)
+
+
+# ============================================================
+# Anima Artist Mixer integration for get_weighted_text_embeddings_anima
+# ============================================================
+# This late override keeps all original sd_embed / diffusers_anima weighted
+# encoding helpers above, and adds an optional transformer-side Artist Mixer
+# patch for prompts such as:
+#   {@vlizz:[style:1.0, pose:0.4], @ashraely:[style:0.6, body:0.8]}
+#   @vlizz:[style:0.7, face:0.4, pose:1.2]
+#
+# Usage:
+#   pos, neg = get_weighted_text_embeddings_anima(
+#       pipe,
+#       prompt="{@a:[style:1.0], @b:[eyes:0.6]}, 1girl",
+#       enable_artist_mixer=True,
+#   )
+#   image = pipe(prompt_embeds=pos, negative_prompt_embeds=neg).images[0]
+#   uninstall_anima_artist_mixer(pipe)
+
+try:
+    from sd_embed.anima_artist_mixer_plus_diffusers import (
+        DiffusersAnimaArtistMixer as _SDEmbedDiffusersAnimaArtistMixer,
+        parse_artist_mixer_syntax as _sd_embed_parse_artist_mixer_syntax,
+        FUSION_INTERPOLATE as _SD_EMBED_MIXER_FUSION_INTERPOLATE,
+        FUSION_BASE_PRESERVE as _SD_EMBED_MIXER_FUSION_BASE_PRESERVE,
+        COMBINE_OUTPUT_AVG as _SD_EMBED_MIXER_COMBINE_OUTPUT_AVG,
+        COMBINE_LOWRANK_AVG as _SD_EMBED_MIXER_COMBINE_LOWRANK_AVG,
+    )
+except Exception:  # The encoder remains usable even if the mixer file is not installed.
+    _SDEmbedDiffusersAnimaArtistMixer = None
+    _sd_embed_parse_artist_mixer_syntax = None
+    _SD_EMBED_MIXER_FUSION_INTERPOLATE = "interpolate"
+    _SD_EMBED_MIXER_FUSION_BASE_PRESERVE = "base_preserve"
+    _SD_EMBED_MIXER_COMBINE_OUTPUT_AVG = "output_avg"
+    _SD_EMBED_MIXER_COMBINE_LOWRANK_AVG = "lowrank_avg"
+
+
+def _anima_artist_mixer_split_prompt_segments(text: str) -> List[str]:
+    """Split a prompt by top-level commas while preserving bracketed mixer blocks."""
+    s = str(text or "")
+    out: List[str] = []
+    buf: List[str] = []
+    stack: List[str] = []
+    pairs = {"[": "]", "{": "}", "(": ")"}
+    quote = None
+    i = 0
+    while i < len(s):
+        ch = s[i]
+        if ch == "\\" and i + 1 < len(s):
+            buf.append(ch); buf.append(s[i + 1]); i += 2; continue
+        if quote is not None:
+            buf.append(ch)
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in ('"', "'"):
+            quote = ch
+            buf.append(ch)
+        elif ch in pairs:
+            stack.append(pairs[ch])
+            buf.append(ch)
+        elif stack and ch == stack[-1]:
+            stack.pop()
+            buf.append(ch)
+        elif ch == "," and not stack:
+            out.append("".join(buf))
+            buf = []
+        else:
+            buf.append(ch)
+        i += 1
+    out.append("".join(buf))
+    return out
+
+
+def _anima_artist_mixer_is_candidate(segment: str) -> bool:
+    s = str(segment or "").strip()
+    if not s or "@" not in s:
+        return False
+    if s.startswith("{") and s.endswith("}"):
+        return ":" in s
+    if s.startswith("::@") or s.startswith("@"):
+        # Do not steal plain @artist tags from the normal Anima prompt.
+        return (": [" in s) or (":" in s and "[" in s) or (s.count(":") >= 2) or ("::" in s)
+    return False
+
+
+def _anima_artist_mixer_parse_nonempty(syntax: str) -> bool:
+    if _sd_embed_parse_artist_mixer_syntax is None:
+        return False
+    try:
+        specs = _sd_embed_parse_artist_mixer_syntax(syntax or "")
+        return bool(specs)
+    except Exception:
+        return False
+
+
+def _anima_artist_mixer_extract_from_prompt(text: str) -> Tuple[str, List[str]]:
+    """Return (clean_prompt, mixer_syntaxes) for top-level Artist Mixer syntax.
+
+    The extractor is intentionally conservative: normal @artist tags are left in
+    the prompt unless they use a component syntax or a grouped mixer syntax.
+    """
+    segments = _anima_artist_mixer_split_prompt_segments(text or "")
+    clean: List[str] = []
+    found: List[str] = []
+    for seg in segments:
+        raw = seg.strip()
+        if _anima_artist_mixer_is_candidate(raw) and _anima_artist_mixer_parse_nonempty(raw):
+            found.append(raw)
+        else:
+            clean.append(seg.strip())
+    return ", ".join([x for x in clean if x]), found
+
+
+def _anima_artist_mixer_extract_batch(prompts: List[str]) -> Tuple[List[str], Optional[str]]:
+    cleaned: List[str] = []
+    syntaxes: List[str] = []
+    for p in prompts:
+        c, found = _anima_artist_mixer_extract_from_prompt(p or "")
+        cleaned.append(c)
+        syntaxes.extend(found)
+    if not syntaxes:
+        return cleaned, None
+    # A single transformer patch is global for the whole denoising pass.  If a
+    # batch contains multiple different mixer blocks, merge them in declaration
+    # order. This is predictable and avoids silently choosing only the first one.
+    if len(syntaxes) == 1:
+        return cleaned, syntaxes[0]
+    return cleaned, "{" + ", ".join(s.strip()[1:-1].strip() if s.strip().startswith("{") and s.strip().endswith("}") else s.strip() for s in syntaxes) + "}"
+
+
+def _anima_artist_mixer_make_encoder(
+    pipe,
+    *,
+    max_sequence_length: int,
+    qwen_weight_strength: float,
+    adapter_weight_strength: float,
+    weight_clamp_min: Optional[float],
+    weight_clamp_max: Optional[float],
+):
+    """Artist encoder used by the mixer, sharing this file's Anima v3 path."""
+    def _encode_artist(_pipe, text: str) -> torch.Tensor:
+        return _anima_v3_encode_single(
+            pipe,
+            text or "",
+            max_sequence_length=max_sequence_length,
+            qwen_weight_strength=qwen_weight_strength,
+            adapter_weight_strength=adapter_weight_strength,
+            weight_clamp_min=weight_clamp_min,
+            weight_clamp_max=weight_clamp_max,
+        )
+    return _encode_artist
+
+
+def uninstall_anima_artist_mixer(pipe) -> None:
+    """Remove the transformer patch created by get_weighted_text_embeddings_anima."""
+    mixer = getattr(pipe, "_sd_embed_anima_artist_mixer", None)
+    if mixer is not None:
+        try:
+            mixer.uninstall()
+        finally:
+            try:
+                delattr(pipe, "_sd_embed_anima_artist_mixer")
+            except Exception:
+                setattr(pipe, "_sd_embed_anima_artist_mixer", None)
+
+
+def get_anima_artist_mixer(pipe):
+    """Return the currently installed Artist Mixer patcher, if any."""
+    return getattr(pipe, "_sd_embed_anima_artist_mixer", None)
+
+
+def _install_anima_artist_mixer_for_encoder(
+    pipe,
+    *,
+    mixer_syntax: str,
+    base_prompt: str,
+    max_sequence_length: int,
+    qwen_weight_strength: float,
+    adapter_weight_strength: float,
+    weight_clamp_min: Optional[float],
+    weight_clamp_max: Optional[float],
+    strength: float,
+    normalize_weights: bool,
+    fusion_mode: str,
+    combine_mode: str,
+    lowrank_k: int,
+    start_block: int,
+    end_block: int,
+    autoclean_previous: bool,
+):
+    if _SDEmbedDiffusersAnimaArtistMixer is None:
+        raise ImportError(
+            "anima_artist_mixer_plus_diffusers.py is required for enable_artist_mixer=True. "
+            "Place it next to embedding_funcs.py or install it on PYTHONPATH."
+        )
+    if autoclean_previous:
+        uninstall_anima_artist_mixer(pipe)
+    encoder = _anima_artist_mixer_make_encoder(
+        pipe,
+        max_sequence_length=max_sequence_length,
+        qwen_weight_strength=qwen_weight_strength,
+        adapter_weight_strength=adapter_weight_strength,
+        weight_clamp_min=weight_clamp_min,
+        weight_clamp_max=weight_clamp_max,
+    )
+    mixer = _SDEmbedDiffusersAnimaArtistMixer(pipe)
+    mixer.install(
+        syntax=mixer_syntax,
+        base_prompt=base_prompt,
+        encode_artist_fn=encoder,
+        strength=float(strength),
+        normalize_weights=bool(normalize_weights),
+        fusion_mode=str(fusion_mode),
+        combine_mode=str(combine_mode),
+        lowrank_k=int(lowrank_k),
+        start_block=int(start_block),
+        end_block=int(end_block),
+    )
+    setattr(pipe, "_sd_embed_anima_artist_mixer", mixer)
+    return mixer
+
+
+@torch.no_grad()
+def get_weighted_text_embeddings_anima(
+    pipe,
+    prompt: Union[str, List[str]] = "",
+    neg_prompt: Union[str, List[str], None] = "",
+    *,
+    num_images_per_prompt: int = 1,
+    max_sequence_length: int = 512,
+    lora_scale: Optional[float] = None,
+    qwen_weight_strength: float = 1.25,
+    adapter_weight_strength: float = 1.75,
+    weight_clamp_min: Optional[float] = 0.0,
+    weight_clamp_max: Optional[float] = 3.0,
+    enable_AND: bool = True,
+    and_strength: float = 0.60,
+    base_bias: float = 4.0,
+    # Artist Mixer options
+    enable_artist_mixer: bool = False,
+    artist_mixer: Optional[str] = None,
+    artist_mixer_strength: float = 1.0,
+    artist_mixer_normalize_weights: bool = True,
+    artist_mixer_fusion_mode: str = "interpolate",
+    artist_mixer_combine_mode: str = "output_avg",
+    artist_mixer_lowrank_k: int = 1,
+    artist_mixer_start_block: int = 0,
+    artist_mixer_end_block: int = -1,
+    artist_mixer_autoclean_previous: bool = True,
+    return_artist_mixer: bool = False,
+) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, Any]]:
+    """Return Anima positive/negative conditioning with optional Artist Mixer.
+
+    `enable_artist_mixer=True` extracts top-level Artist Mixer syntax from the
+    positive prompt and installs a transformer patch that remains active for the
+    following pipeline call.  Call `uninstall_anima_artist_mixer(pipe)` after
+    generation, or pass `return_artist_mixer=True` and call `mixer.uninstall()`.
+
+    You may also pass `artist_mixer="{@a:[style:1.0], @b:[eyes:0.6]}"` to keep
+    mixer syntax outside of the visible prompt.
+    """
+    dynamically_scale_lora_layers(pipe, lora_scale=lora_scale)
+    mixer_obj = None
+    try:
+        prompt_list, neg_list = _anima_v3_expand_prompt_inputs(
+            prompt,
+            neg_prompt,
+            num_images_per_prompt=num_images_per_prompt,
+        )
+
+        mixer_syntax = artist_mixer.strip() if isinstance(artist_mixer, str) and artist_mixer.strip() else None
+        if enable_artist_mixer:
+            cleaned_prompt_list, extracted = _anima_artist_mixer_extract_batch(prompt_list)
+            prompt_list = cleaned_prompt_list
+            if mixer_syntax is None:
+                mixer_syntax = extracted
+        elif mixer_syntax is not None:
+            # Explicit mixer string means: install the patch, but do not force users
+            # to put the mixer syntax in the visible prompt.
+            enable_artist_mixer = True
+
+        if enable_artist_mixer and mixer_syntax:
+            base_for_artist = prompt_list[0] if prompt_list else ""
+            mixer_obj = _install_anima_artist_mixer_for_encoder(
+                pipe,
+                mixer_syntax=mixer_syntax,
+                base_prompt=base_for_artist,
+                max_sequence_length=max_sequence_length,
+                qwen_weight_strength=qwen_weight_strength,
+                adapter_weight_strength=adapter_weight_strength,
+                weight_clamp_min=weight_clamp_min,
+                weight_clamp_max=weight_clamp_max,
+                strength=artist_mixer_strength,
+                normalize_weights=artist_mixer_normalize_weights,
+                fusion_mode=artist_mixer_fusion_mode,
+                combine_mode=artist_mixer_combine_mode,
+                lowrank_k=artist_mixer_lowrank_k,
+                start_block=artist_mixer_start_block,
+                end_block=artist_mixer_end_block,
+                autoclean_previous=artist_mixer_autoclean_previous,
+            )
+
+        if enable_AND and (any(_has_top_level_AND(p or "") for p in prompt_list) or any(_has_top_level_AND(n or "") for n in neg_list)):
+            pos = torch.cat([
+                _anima_v3_mix_AND(
+                    pipe,
+                    p or "",
+                    max_sequence_length=max_sequence_length,
+                    qwen_weight_strength=qwen_weight_strength,
+                    adapter_weight_strength=adapter_weight_strength,
+                    weight_clamp_min=weight_clamp_min,
+                    weight_clamp_max=weight_clamp_max,
+                    and_strength=and_strength,
+                    base_bias=base_bias,
+                )
+                for p in prompt_list
+            ], dim=0)
+            neg = torch.cat([
+                _anima_v3_mix_AND(
+                    pipe,
+                    n or "",
+                    max_sequence_length=max_sequence_length,
+                    qwen_weight_strength=qwen_weight_strength,
+                    adapter_weight_strength=adapter_weight_strength,
+                    weight_clamp_min=weight_clamp_min,
+                    weight_clamp_max=weight_clamp_max,
+                    and_strength=and_strength,
+                    base_bias=base_bias,
+                )
+                for n in neg_list
+            ], dim=0)
+        else:
+            pos = _anima_v3_encode_batch(
+                pipe,
+                [p or "" for p in prompt_list],
+                max_sequence_length=max_sequence_length,
+                qwen_weight_strength=qwen_weight_strength,
+                adapter_weight_strength=adapter_weight_strength,
+                weight_clamp_min=weight_clamp_min,
+                weight_clamp_max=weight_clamp_max,
+            )
+            neg = _anima_v3_encode_batch(
+                pipe,
+                [n or "" for n in neg_list],
+                max_sequence_length=max_sequence_length,
+                qwen_weight_strength=qwen_weight_strength,
+                adapter_weight_strength=adapter_weight_strength,
+                weight_clamp_min=weight_clamp_min,
+                weight_clamp_max=weight_clamp_max,
+            )
+
+        if return_artist_mixer:
+            return pos, neg, mixer_obj
+        return pos, neg
+    finally:
+        dynamically_unscale_lora_layers(pipe, lora_scale=lora_scale)
