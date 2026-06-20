@@ -2648,6 +2648,15 @@ except Exception:  # pragma: no cover
 _ANIMA_QWEN3_DEFAULT_PAD_TOKEN_ID = 151643
 _ANIMA_CONDITIONING_MAX_LENGTH = 512
 
+# Anima's final conditioning tensor is 512 tokens wide.  Passing more than
+# 512 source tokens through a single preprocess_text_embeds call causes the
+# extra part to be cropped or heavily diluted.  The long-prompt path below
+# encodes the prompt in native 512-token windows, then folds those windows back
+# into one 512-token conditioning tensor so tokens after the first window still
+# affect generation.
+_ANIMA_LONG_PROMPT_FUSION_CHUNK_BLEND = "chunk_blend"
+_ANIMA_LONG_PROMPT_FUSION_TRUNCATE = "truncate"
+
 
 def _anima_v3_flatten_ids(value) -> List[int]:
     if isinstance(value, torch.Tensor):
@@ -3051,6 +3060,327 @@ def _anima_v3_prepare_condition_inputs(
     return qwen_hidden, t5_ids, t5_weights_t
 
 
+def _anima_v3_long_prompt_chunk_size(max_sequence_length: int, long_prompt_chunk_size: Optional[int]) -> int:
+    if long_prompt_chunk_size is not None and int(long_prompt_chunk_size) > 0:
+        return max(1, min(int(long_prompt_chunk_size), _ANIMA_CONDITIONING_MAX_LENGTH))
+    if max_sequence_length is not None and int(max_sequence_length) > 0:
+        # Never use a window wider than the final Anima conditioning width.
+        # Otherwise preprocess_text_embeds can create information that is then
+        # cropped back to 512, reproducing the original weak-tail behavior.
+        return max(1, min(int(max_sequence_length), _ANIMA_CONDITIONING_MAX_LENGTH))
+    return _ANIMA_CONDITIONING_MAX_LENGTH
+
+
+def _anima_v3_split_ids_weights(
+    token_ids: List[int],
+    token_weights: List[float],
+    *,
+    chunk_size: int,
+    empty_token_id: int,
+    add_eos: bool = False,
+    eos_token_id: Optional[int] = None,
+) -> Tuple[List[List[int]], List[List[float]]]:
+    chunk_size = max(1, int(chunk_size))
+    token_ids = [int(x) for x in (token_ids or [])]
+    token_weights = [float(x) for x in (token_weights or [])]
+    if len(token_weights) < len(token_ids):
+        token_weights = [*token_weights, *([1.0] * (len(token_ids) - len(token_weights)))]
+    elif len(token_weights) > len(token_ids):
+        token_weights = token_weights[:len(token_ids)]
+
+    if not token_ids:
+        if add_eos:
+            eos = int(eos_token_id if eos_token_id is not None else empty_token_id)
+            return [[eos]], [[1.0]]
+        return [[int(empty_token_id)]], [[1.0]]
+
+    if add_eos:
+        eos = int(eos_token_id if eos_token_id is not None else empty_token_id)
+        # Keep one slot for EOS in every T5 window.  This gives each window a
+        # complete prompt-like sequence instead of only the final window being
+        # terminated.
+        content_budget = max(1, chunk_size - 1)
+    else:
+        eos = None
+        content_budget = chunk_size
+
+    id_chunks: List[List[int]] = []
+    weight_chunks: List[List[float]] = []
+    for start in range(0, len(token_ids), content_budget):
+        ids = token_ids[start:start + content_budget]
+        weights = token_weights[start:start + content_budget]
+        if add_eos:
+            ids = [*ids, int(eos)]
+            weights = [*weights, 1.0]
+        id_chunks.append(ids)
+        weight_chunks.append(weights)
+    return id_chunks, weight_chunks
+
+
+def _anima_v3_empty_chunk(*, empty_token_id: int, add_eos: bool = False, eos_token_id: Optional[int] = None) -> Tuple[List[int], List[float]]:
+    if add_eos:
+        return [int(eos_token_id if eos_token_id is not None else empty_token_id)], [1.0]
+    return [int(empty_token_id)], [1.0]
+
+
+@torch.no_grad()
+def _anima_v3_prepare_condition_inputs_from_token_batches(
+    pipe,
+    *,
+    qwen_batches: List[List[int]],
+    qwen_weight_batches: List[List[float]],
+    t5_batches: List[List[int]],
+    t5_weight_batches: List[List[float]],
+    qwen_weight_strength: float,
+    t5_weight_strength: float,
+    weight_clamp_min: Optional[float],
+    weight_clamp_max: Optional[float],
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if len(qwen_batches) == 0:
+        raise ValueError("token batch must not be empty")
+    if not (len(qwen_batches) == len(qwen_weight_batches) == len(t5_batches) == len(t5_weight_batches)):
+        raise ValueError("qwen/t5 token batch size mismatch")
+
+    _prompt_tokenizer, qwen_tokenizer, t5_tokenizer = _anima_v3_get_prompt_tokenizer(pipe)
+    text_encoder = _anima_get_component(pipe, ["text_encoder"], required=True)
+    execution_device, model_dtype, text_encoder_dtype, enable_offload = _anima_v3_pipeline_runtime(pipe)
+
+    qwen_pad = getattr(qwen_tokenizer, "pad_token_id", None)
+    if qwen_pad is None:
+        qwen_pad = _ANIMA_QWEN3_DEFAULT_PAD_TOKEN_ID
+    t5_pad = getattr(t5_tokenizer, "pad_token_id", None)
+    if t5_pad is None:
+        t5_pad = 0
+
+    max_qwen_len = max(1, max(len(x) for x in qwen_batches))
+    max_t5_len = max(1, max(len(x) for x in t5_batches))
+    batch_size = len(qwen_batches)
+
+    qwen_ids = torch.full(
+        (batch_size, max_qwen_len),
+        int(qwen_pad),
+        dtype=torch.long,
+        device=execution_device,
+    )
+    qwen_mask = torch.zeros(
+        (batch_size, max_qwen_len),
+        dtype=torch.long,
+        device=execution_device,
+    )
+    qwen_weights_t = torch.ones(
+        (batch_size, max_qwen_len),
+        dtype=torch.float32,
+        device=execution_device,
+    )
+    t5_ids = torch.full(
+        (batch_size, max_t5_len),
+        int(t5_pad),
+        dtype=torch.int32,
+        device=execution_device,
+    )
+    t5_weights_t = torch.zeros(
+        (batch_size, max_t5_len, 1),
+        dtype=torch.float32,
+        device=execution_device,
+    )
+
+    for i, (q_ids, q_weights, tt_ids, tt_weights) in enumerate(zip(qwen_batches, qwen_weight_batches, t5_batches, t5_weight_batches)):
+        q_ids = [int(x) for x in (q_ids or [qwen_pad])]
+        tt_ids = [int(x) for x in (tt_ids or [t5_pad])]
+        q_weights = [float(x) for x in (q_weights or [1.0] * len(q_ids))]
+        tt_weights = [float(x) for x in (tt_weights or [1.0] * len(tt_ids))]
+        if len(q_weights) < len(q_ids):
+            q_weights = [*q_weights, *([1.0] * (len(q_ids) - len(q_weights)))]
+        elif len(q_weights) > len(q_ids):
+            q_weights = q_weights[:len(q_ids)]
+        if len(tt_weights) < len(tt_ids):
+            tt_weights = [*tt_weights, *([1.0] * (len(tt_ids) - len(tt_weights)))]
+        elif len(tt_weights) > len(tt_ids):
+            tt_weights = tt_weights[:len(tt_ids)]
+        q_len = len(q_ids)
+        t_len = len(tt_ids)
+        qwen_ids[i, :q_len] = torch.tensor(q_ids, dtype=torch.long, device=execution_device)
+        qwen_mask[i, :q_len] = 1
+        qwen_weights_t[i, :q_len] = torch.tensor(q_weights[:q_len], dtype=torch.float32, device=execution_device)
+        t5_ids[i, :t_len] = torch.tensor(tt_ids, dtype=torch.int32, device=execution_device)
+        raw_t5_weights = torch.tensor(tt_weights[:t_len], dtype=torch.float32, device=execution_device).view(t_len, 1)
+        scaled_t5_weights = _anima_v3_scale_weight_tensor(
+            raw_t5_weights,
+            strength=t5_weight_strength,
+            clamp_min=weight_clamp_min,
+            clamp_max=weight_clamp_max,
+        )
+        t5_weights_t[i, :t_len, :] = scaled_t5_weights
+
+    with _anima_v3_module_execution_context(
+        text_encoder,
+        execution_device=execution_device,
+        execution_dtype=text_encoder_dtype,
+        enable_offload=enable_offload,
+    ):
+        with torch.inference_mode():
+            out = text_encoder(input_ids=qwen_ids, attention_mask=qwen_mask)
+            if isinstance(out, tuple):
+                qwen_hidden = out[0]
+            else:
+                qwen_hidden = out.last_hidden_state
+            qwen_hidden = qwen_hidden.to(device=execution_device, dtype=model_dtype)
+            qwen_hidden = _anima_v3_apply_qwen_weights(
+                qwen_hidden,
+                qwen_weights_t,
+                qwen_mask,
+                strength=qwen_weight_strength,
+                clamp_min=weight_clamp_min,
+                clamp_max=weight_clamp_max,
+            )
+
+    return qwen_hidden, t5_ids, t5_weights_t
+
+
+def _anima_v3_fuse_long_prompt_conditions(
+    conditions: List[torch.Tensor],
+    *,
+    strength: float,
+    chunk_decay: float,
+) -> torch.Tensor:
+    if not conditions:
+        raise ValueError("conditions must not be empty")
+    if len(conditions) == 1:
+        return conditions[0]
+
+    decay = float(chunk_decay)
+    if not math.isfinite(decay) or decay <= 0:
+        decay = 1.0
+    weights = torch.tensor(
+        [decay ** i for i in range(len(conditions))],
+        dtype=torch.float32,
+        device=conditions[0].device,
+    )
+    weights = weights / weights.sum().clamp_min(1e-6)
+    stacked = torch.stack(conditions, dim=0)  # (C,B,512,D)
+    fused = (stacked * weights.view(-1, 1, 1, 1).to(dtype=stacked.dtype)).sum(dim=0)
+
+    s = float(strength)
+    if not math.isfinite(s):
+        s = 1.0
+    return conditions[0] + (fused - conditions[0]) * s
+
+
+@torch.no_grad()
+def _anima_v3_encode_long_single(
+    pipe,
+    text: str,
+    *,
+    max_sequence_length: int,
+    qwen_weight_strength: float,
+    adapter_weight_strength: float,
+    weight_clamp_min: Optional[float],
+    weight_clamp_max: Optional[float],
+    long_prompt_chunk_size: Optional[int],
+    long_prompt_chunk_decay: float,
+    long_prompt_strength: float,
+) -> torch.Tensor:
+    _prompt_tokenizer, qwen_tokenizer, t5_tokenizer = _anima_v3_get_prompt_tokenizer(pipe)
+    qwen_pad = getattr(qwen_tokenizer, "pad_token_id", None)
+    if qwen_pad is None:
+        qwen_pad = _ANIMA_QWEN3_DEFAULT_PAD_TOKEN_ID
+    t5_eos = getattr(t5_tokenizer, "eos_token_id", None)
+    if t5_eos is None:
+        t5_eos = 1
+
+    q_ids, q_weights, _clean_q, _has_q = _anima_v3_tokenize_with_weights(
+        qwen_tokenizer,
+        text or "",
+        empty_token_id=int(qwen_pad),
+        add_eos=False,
+        eos_token_id=None,
+        truncate_to=None,
+    )
+    t_ids, t_weights, clean_t, _has_t = _anima_v3_tokenize_with_weights(
+        t5_tokenizer,
+        text or "",
+        empty_token_id=int(t5_eos),
+        add_eos=False,
+        eos_token_id=None,
+        truncate_to=None,
+    )
+
+    chunk_size = _anima_v3_long_prompt_chunk_size(max_sequence_length, long_prompt_chunk_size)
+
+    # Fast path: keep the old/native behavior exactly for prompts that fit in
+    # one conditioning window.  T5 needs one extra slot for EOS.
+    if len(q_ids) <= chunk_size and (len(t_ids) + 1) <= chunk_size:
+        qwen_hidden, t5_ids, t5_weights = _anima_v3_prepare_condition_inputs(
+            pipe,
+            [text or ""],
+            max_sequence_length=chunk_size,
+            qwen_weight_strength=qwen_weight_strength,
+            t5_weight_strength=adapter_weight_strength,
+            weight_clamp_min=weight_clamp_min,
+            weight_clamp_max=weight_clamp_max,
+        )
+        return _anima_v3_build_condition(
+            pipe,
+            qwen_hidden=qwen_hidden,
+            t5_ids=t5_ids,
+            t5_weights=t5_weights,
+        )
+
+    q_chunks, qw_chunks = _anima_v3_split_ids_weights(
+        q_ids,
+        q_weights,
+        chunk_size=chunk_size,
+        empty_token_id=int(qwen_pad),
+        add_eos=False,
+        eos_token_id=None,
+    )
+    if clean_t:
+        t_chunks, tw_chunks = _anima_v3_split_ids_weights(
+            t_ids,
+            t_weights,
+            chunk_size=chunk_size,
+            empty_token_id=int(t5_eos),
+            add_eos=True,
+            eos_token_id=int(t5_eos),
+        )
+    else:
+        t_chunks, tw_chunks = [[int(t5_eos)]], [[1.0]]
+
+    num_chunks = max(len(q_chunks), len(t_chunks))
+    empty_q_ids, empty_q_weights = _anima_v3_empty_chunk(empty_token_id=int(qwen_pad), add_eos=False)
+    empty_t_ids, empty_t_weights = _anima_v3_empty_chunk(empty_token_id=int(t5_eos), add_eos=True, eos_token_id=int(t5_eos))
+
+    chunk_conditions: List[torch.Tensor] = []
+    for idx in range(num_chunks):
+        q_batch = [q_chunks[idx] if idx < len(q_chunks) else empty_q_ids]
+        qw_batch = [qw_chunks[idx] if idx < len(qw_chunks) else empty_q_weights]
+        t_batch = [t_chunks[idx] if idx < len(t_chunks) else empty_t_ids]
+        tw_batch = [tw_chunks[idx] if idx < len(tw_chunks) else empty_t_weights]
+        qwen_hidden, t5_ids_t, t5_weights_t = _anima_v3_prepare_condition_inputs_from_token_batches(
+            pipe,
+            qwen_batches=q_batch,
+            qwen_weight_batches=qw_batch,
+            t5_batches=t_batch,
+            t5_weight_batches=tw_batch,
+            qwen_weight_strength=qwen_weight_strength,
+            t5_weight_strength=adapter_weight_strength,
+            weight_clamp_min=weight_clamp_min,
+            weight_clamp_max=weight_clamp_max,
+        )
+        chunk_conditions.append(_anima_v3_build_condition(
+            pipe,
+            qwen_hidden=qwen_hidden,
+            t5_ids=t5_ids_t,
+            t5_weights=t5_weights_t,
+        ))
+
+    return _anima_v3_fuse_long_prompt_conditions(
+        chunk_conditions,
+        strength=long_prompt_strength,
+        chunk_decay=long_prompt_chunk_decay,
+    )
+
+
 @torch.no_grad()
 def _anima_v3_build_condition(
     pipe,
@@ -3100,22 +3430,47 @@ def _anima_v3_encode_batch(
     adapter_weight_strength: float,
     weight_clamp_min: Optional[float],
     weight_clamp_max: Optional[float],
+    enable_long_prompt: bool = True,
+    long_prompt_strategy: str = _ANIMA_LONG_PROMPT_FUSION_CHUNK_BLEND,
+    long_prompt_chunk_size: Optional[int] = None,
+    long_prompt_chunk_decay: float = 1.0,
+    long_prompt_strength: float = 1.0,
 ) -> torch.Tensor:
-    qwen_hidden, t5_ids, t5_weights = _anima_v3_prepare_condition_inputs(
-        pipe,
-        prompts,
-        max_sequence_length=max_sequence_length,
-        qwen_weight_strength=qwen_weight_strength,
-        t5_weight_strength=adapter_weight_strength,
-        weight_clamp_min=weight_clamp_min,
-        weight_clamp_max=weight_clamp_max,
-    )
-    return _anima_v3_build_condition(
-        pipe,
-        qwen_hidden=qwen_hidden,
-        t5_ids=t5_ids,
-        t5_weights=t5_weights,
-    )
+    if not enable_long_prompt or str(long_prompt_strategy).lower() == _ANIMA_LONG_PROMPT_FUSION_TRUNCATE:
+        qwen_hidden, t5_ids, t5_weights = _anima_v3_prepare_condition_inputs(
+            pipe,
+            prompts,
+            max_sequence_length=max_sequence_length,
+            qwen_weight_strength=qwen_weight_strength,
+            t5_weight_strength=adapter_weight_strength,
+            weight_clamp_min=weight_clamp_min,
+            weight_clamp_max=weight_clamp_max,
+        )
+        return _anima_v3_build_condition(
+            pipe,
+            qwen_hidden=qwen_hidden,
+            t5_ids=t5_ids,
+            t5_weights=t5_weights,
+        )
+
+    # Long-prompt mode is per prompt because each prompt can expand to a
+    # different number of 512-token windows.  Single-window prompts still use
+    # the native batch path inside _anima_v3_encode_long_single.
+    return torch.cat([
+        _anima_v3_encode_long_single(
+            pipe,
+            p or "",
+            max_sequence_length=max_sequence_length,
+            qwen_weight_strength=qwen_weight_strength,
+            adapter_weight_strength=adapter_weight_strength,
+            weight_clamp_min=weight_clamp_min,
+            weight_clamp_max=weight_clamp_max,
+            long_prompt_chunk_size=long_prompt_chunk_size,
+            long_prompt_chunk_decay=long_prompt_chunk_decay,
+            long_prompt_strength=long_prompt_strength,
+        )
+        for p in prompts
+    ], dim=0)
 
 
 @torch.no_grad()
@@ -3128,6 +3483,11 @@ def _anima_v3_encode_single(
     adapter_weight_strength: float,
     weight_clamp_min: Optional[float],
     weight_clamp_max: Optional[float],
+    enable_long_prompt: bool = True,
+    long_prompt_strategy: str = _ANIMA_LONG_PROMPT_FUSION_CHUNK_BLEND,
+    long_prompt_chunk_size: Optional[int] = None,
+    long_prompt_chunk_decay: float = 1.0,
+    long_prompt_strength: float = 1.0,
 ) -> torch.Tensor:
     return _anima_v3_encode_batch(
         pipe,
@@ -3137,6 +3497,11 @@ def _anima_v3_encode_single(
         adapter_weight_strength=adapter_weight_strength,
         weight_clamp_min=weight_clamp_min,
         weight_clamp_max=weight_clamp_max,
+        enable_long_prompt=enable_long_prompt,
+        long_prompt_strategy=long_prompt_strategy,
+        long_prompt_chunk_size=long_prompt_chunk_size,
+        long_prompt_chunk_decay=long_prompt_chunk_decay,
+        long_prompt_strength=long_prompt_strength,
     )
 
 
@@ -3152,6 +3517,11 @@ def _anima_v3_mix_AND(
     weight_clamp_max: Optional[float],
     and_strength: float,
     base_bias: float,
+    enable_long_prompt: bool = True,
+    long_prompt_strategy: str = _ANIMA_LONG_PROMPT_FUSION_CHUNK_BLEND,
+    long_prompt_chunk_size: Optional[int] = None,
+    long_prompt_chunk_decay: float = 1.0,
+    long_prompt_strength: float = 1.0,
 ) -> torch.Tensor:
     parts = _split_top_level_AND(text or "")
     parsed: List[Tuple[str, float]] = []
@@ -3169,6 +3539,11 @@ def _anima_v3_mix_AND(
             adapter_weight_strength=adapter_weight_strength,
             weight_clamp_min=weight_clamp_min,
             weight_clamp_max=weight_clamp_max,
+            enable_long_prompt=enable_long_prompt,
+            long_prompt_strategy=long_prompt_strategy,
+            long_prompt_chunk_size=long_prompt_chunk_size,
+            long_prompt_chunk_decay=long_prompt_chunk_decay,
+            long_prompt_strength=long_prompt_strength,
         )
 
     clean_all, _spans, _has_weight = _anima_v3_weighted_spans(text or "")
@@ -3180,6 +3555,11 @@ def _anima_v3_mix_AND(
         adapter_weight_strength=adapter_weight_strength,
         weight_clamp_min=weight_clamp_min,
         weight_clamp_max=weight_clamp_max,
+        enable_long_prompt=enable_long_prompt,
+        long_prompt_strategy=long_prompt_strategy,
+        long_prompt_chunk_size=long_prompt_chunk_size,
+        long_prompt_chunk_decay=long_prompt_chunk_decay,
+        long_prompt_strength=long_prompt_strength,
     )
     mixed = base * float(base_bias)
     denom = abs(float(base_bias)) + 1e-6
@@ -3192,6 +3572,11 @@ def _anima_v3_mix_AND(
             adapter_weight_strength=adapter_weight_strength,
             weight_clamp_min=weight_clamp_min,
             weight_clamp_max=weight_clamp_max,
+            enable_long_prompt=enable_long_prompt,
+            long_prompt_strategy=long_prompt_strategy,
+            long_prompt_chunk_size=long_prompt_chunk_size,
+            long_prompt_chunk_decay=long_prompt_chunk_decay,
+            long_prompt_strength=long_prompt_strength,
         )
         wf = float(part_weight)
         if wf < 0.0:
@@ -3201,7 +3586,6 @@ def _anima_v3_mix_AND(
         denom += abs(wf)
     mixed = mixed / denom
     return base + (mixed - base) * float(and_strength)
-
 
 def _anima_v3_expand_prompt_inputs(
     prompt: Union[str, List[str], Tuple[str, ...]],
@@ -3253,6 +3637,11 @@ def get_weighted_text_embeddings_anima(
     enable_AND: bool = True,
     and_strength: float = 0.60,
     base_bias: float = 4.0,
+    enable_long_prompt: bool = True,
+    long_prompt_strategy: str = _ANIMA_LONG_PROMPT_FUSION_CHUNK_BLEND,
+    long_prompt_chunk_size: Optional[int] = None,
+    long_prompt_chunk_decay: float = 1.0,
+    long_prompt_strength: float = 1.0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Return Anima positive/negative conditioning with sd_embed prompt weights.
 
@@ -3289,6 +3678,11 @@ def get_weighted_text_embeddings_anima(
                     weight_clamp_max=weight_clamp_max,
                     and_strength=and_strength,
                     base_bias=base_bias,
+                    enable_long_prompt=enable_long_prompt,
+                    long_prompt_strategy=long_prompt_strategy,
+                    long_prompt_chunk_size=long_prompt_chunk_size,
+                    long_prompt_chunk_decay=long_prompt_chunk_decay,
+                    long_prompt_strength=long_prompt_strength,
                 )
                 for p in prompt_list
             ], dim=0)
@@ -3303,6 +3697,11 @@ def get_weighted_text_embeddings_anima(
                     weight_clamp_max=weight_clamp_max,
                     and_strength=and_strength,
                     base_bias=base_bias,
+                    enable_long_prompt=enable_long_prompt,
+                    long_prompt_strategy=long_prompt_strategy,
+                    long_prompt_chunk_size=long_prompt_chunk_size,
+                    long_prompt_chunk_decay=long_prompt_chunk_decay,
+                    long_prompt_strength=long_prompt_strength,
                 )
                 for n in neg_list
             ], dim=0)
@@ -3316,6 +3715,11 @@ def get_weighted_text_embeddings_anima(
             adapter_weight_strength=adapter_weight_strength,
             weight_clamp_min=weight_clamp_min,
             weight_clamp_max=weight_clamp_max,
+            enable_long_prompt=enable_long_prompt,
+            long_prompt_strategy=long_prompt_strategy,
+            long_prompt_chunk_size=long_prompt_chunk_size,
+            long_prompt_chunk_decay=long_prompt_chunk_decay,
+            long_prompt_strength=long_prompt_strength,
         )
         neg = _anima_v3_encode_batch(
             pipe,
@@ -3325,6 +3729,11 @@ def get_weighted_text_embeddings_anima(
             adapter_weight_strength=adapter_weight_strength,
             weight_clamp_min=weight_clamp_min,
             weight_clamp_max=weight_clamp_max,
+            enable_long_prompt=enable_long_prompt,
+            long_prompt_strategy=long_prompt_strategy,
+            long_prompt_chunk_size=long_prompt_chunk_size,
+            long_prompt_chunk_decay=long_prompt_chunk_decay,
+            long_prompt_strength=long_prompt_strength,
         )
         return pos, neg
     finally:
@@ -3470,6 +3879,11 @@ def _anima_artist_mixer_make_encoder(
     adapter_weight_strength: float,
     weight_clamp_min: Optional[float],
     weight_clamp_max: Optional[float],
+    enable_long_prompt: bool = True,
+    long_prompt_strategy: str = _ANIMA_LONG_PROMPT_FUSION_CHUNK_BLEND,
+    long_prompt_chunk_size: Optional[int] = None,
+    long_prompt_chunk_decay: float = 1.0,
+    long_prompt_strength: float = 1.0,
 ):
     """Artist encoder used by the mixer, sharing this file's Anima v3 path."""
     def _encode_artist(_pipe, text: str) -> torch.Tensor:
@@ -3481,6 +3895,11 @@ def _anima_artist_mixer_make_encoder(
             adapter_weight_strength=adapter_weight_strength,
             weight_clamp_min=weight_clamp_min,
             weight_clamp_max=weight_clamp_max,
+            enable_long_prompt=enable_long_prompt,
+            long_prompt_strategy=long_prompt_strategy,
+            long_prompt_chunk_size=long_prompt_chunk_size,
+            long_prompt_chunk_decay=long_prompt_chunk_decay,
+            long_prompt_strength=long_prompt_strength,
         )
     return _encode_artist
 
@@ -3513,6 +3932,11 @@ def _install_anima_artist_mixer_for_encoder(
     adapter_weight_strength: float,
     weight_clamp_min: Optional[float],
     weight_clamp_max: Optional[float],
+    enable_long_prompt: bool = True,
+    long_prompt_strategy: str = _ANIMA_LONG_PROMPT_FUSION_CHUNK_BLEND,
+    long_prompt_chunk_size: Optional[int] = None,
+    long_prompt_chunk_decay: float = 1.0,
+    long_prompt_strength: float = 1.0,
     strength: float,
     normalize_weights: bool,
     fusion_mode: str,
@@ -3536,6 +3960,11 @@ def _install_anima_artist_mixer_for_encoder(
         adapter_weight_strength=adapter_weight_strength,
         weight_clamp_min=weight_clamp_min,
         weight_clamp_max=weight_clamp_max,
+        enable_long_prompt=enable_long_prompt,
+        long_prompt_strategy=long_prompt_strategy,
+        long_prompt_chunk_size=long_prompt_chunk_size,
+        long_prompt_chunk_decay=long_prompt_chunk_decay,
+        long_prompt_strength=long_prompt_strength,
     )
     mixer = _SDEmbedDiffusersAnimaArtistMixer(pipe)
     mixer.install(
@@ -3570,6 +3999,12 @@ def get_weighted_text_embeddings_anima(
     enable_AND: bool = True,
     and_strength: float = 0.60,
     base_bias: float = 4.0,
+    # Long prompt options
+    enable_long_prompt: bool = True,
+    long_prompt_strategy: str = _ANIMA_LONG_PROMPT_FUSION_CHUNK_BLEND,
+    long_prompt_chunk_size: Optional[int] = None,
+    long_prompt_chunk_decay: float = 1.0,
+    long_prompt_strength: float = 1.0,
     # Artist Mixer options
     enable_artist_mixer: bool = False,
     artist_mixer: Optional[str] = None,
@@ -3624,6 +4059,11 @@ def get_weighted_text_embeddings_anima(
                 adapter_weight_strength=adapter_weight_strength,
                 weight_clamp_min=weight_clamp_min,
                 weight_clamp_max=weight_clamp_max,
+                enable_long_prompt=enable_long_prompt,
+                long_prompt_strategy=long_prompt_strategy,
+                long_prompt_chunk_size=long_prompt_chunk_size,
+                long_prompt_chunk_decay=long_prompt_chunk_decay,
+                long_prompt_strength=long_prompt_strength,
                 strength=artist_mixer_strength,
                 normalize_weights=artist_mixer_normalize_weights,
                 fusion_mode=artist_mixer_fusion_mode,
@@ -3646,6 +4086,11 @@ def get_weighted_text_embeddings_anima(
                     weight_clamp_max=weight_clamp_max,
                     and_strength=and_strength,
                     base_bias=base_bias,
+                    enable_long_prompt=enable_long_prompt,
+                    long_prompt_strategy=long_prompt_strategy,
+                    long_prompt_chunk_size=long_prompt_chunk_size,
+                    long_prompt_chunk_decay=long_prompt_chunk_decay,
+                    long_prompt_strength=long_prompt_strength,
                 )
                 for p in prompt_list
             ], dim=0)
@@ -3660,6 +4105,11 @@ def get_weighted_text_embeddings_anima(
                     weight_clamp_max=weight_clamp_max,
                     and_strength=and_strength,
                     base_bias=base_bias,
+                    enable_long_prompt=enable_long_prompt,
+                    long_prompt_strategy=long_prompt_strategy,
+                    long_prompt_chunk_size=long_prompt_chunk_size,
+                    long_prompt_chunk_decay=long_prompt_chunk_decay,
+                    long_prompt_strength=long_prompt_strength,
                 )
                 for n in neg_list
             ], dim=0)
@@ -3672,6 +4122,11 @@ def get_weighted_text_embeddings_anima(
                 adapter_weight_strength=adapter_weight_strength,
                 weight_clamp_min=weight_clamp_min,
                 weight_clamp_max=weight_clamp_max,
+                enable_long_prompt=enable_long_prompt,
+                long_prompt_strategy=long_prompt_strategy,
+                long_prompt_chunk_size=long_prompt_chunk_size,
+                long_prompt_chunk_decay=long_prompt_chunk_decay,
+                long_prompt_strength=long_prompt_strength,
             )
             neg = _anima_v3_encode_batch(
                 pipe,
@@ -3681,6 +4136,11 @@ def get_weighted_text_embeddings_anima(
                 adapter_weight_strength=adapter_weight_strength,
                 weight_clamp_min=weight_clamp_min,
                 weight_clamp_max=weight_clamp_max,
+                enable_long_prompt=enable_long_prompt,
+                long_prompt_strategy=long_prompt_strategy,
+                long_prompt_chunk_size=long_prompt_chunk_size,
+                long_prompt_chunk_decay=long_prompt_chunk_decay,
+                long_prompt_strength=long_prompt_strength,
             )
 
         if return_artist_mixer:
