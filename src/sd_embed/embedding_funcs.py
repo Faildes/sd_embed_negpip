@@ -3371,11 +3371,19 @@ def _anima_v3_pad_condition_to_length(cond: torch.Tensor, target_length: int) ->
         return cond
     if cur > tgt:
         return cond[:, :tgt, :]
+
+    # Match diffusers_anima.text_encoding.build_condition: pad missing
+    # conditioning slots with zeros, not repeated EOS/last-token features.
+    # Repeating the last token makes long chunks over-emphasise tail content and
+    # shifts the global style/color distribution.
     pad_len = tgt - cur
-    if cur <= 0:
-        pad = torch.zeros(cond.shape[0], pad_len, cond.shape[2], dtype=cond.dtype, device=cond.device)
-    else:
-        pad = cond[:, -1:, :].expand(cond.shape[0], pad_len, cond.shape[2])
+    pad = torch.zeros(
+        cond.shape[0],
+        pad_len,
+        cond.shape[2],
+        dtype=cond.dtype,
+        device=cond.device,
+    )
     return torch.cat([cond, pad], dim=1)
 
 
@@ -3583,7 +3591,10 @@ def _anima_v3_encode_long_single(
             qwen_hidden=qwen_hidden,
             t5_ids=t5_ids_t,
             t5_weights=t5_weights_t,
-            target_length=None if concat_mode else _ANIMA_CONDITIONING_MAX_LENGTH,
+            # Each long-prompt window should be a native Anima conditioning
+            # window.  Keeping 512 slots per chunk makes the returned seq_len
+            # reflect the number of recognised windows: 512, 1024, 1536, ...
+            target_length=_ANIMA_CONDITIONING_MAX_LENGTH,
         ))
 
     return _anima_v3_fuse_long_prompt_conditions(
@@ -3897,7 +3908,7 @@ def get_weighted_text_embeddings_anima(
         )
 
         if enable_AND and (any(_has_top_level_AND(p or "") for p in prompt_list) or any(_has_top_level_AND(n or "") for n in neg_list)):
-            pos = torch.cat([
+            pos_list = [
                 _anima_v3_mix_AND(
                     pipe,
                     p or "",
@@ -3916,8 +3927,8 @@ def get_weighted_text_embeddings_anima(
                     long_prompt_anchor_tokens=long_prompt_anchor_tokens,
                 )
                 for p in prompt_list
-            ], dim=0)
-            neg = torch.cat([
+            ]
+            neg_list_encoded = [
                 _anima_v3_mix_AND(
                     pipe,
                     n or "",
@@ -3936,7 +3947,13 @@ def get_weighted_text_embeddings_anima(
                     long_prompt_anchor_tokens=long_prompt_anchor_tokens,
                 )
                 for n in neg_list
-            ], dim=0)
+            ]
+            target_len = max(
+                max(int(x.shape[1]) for x in pos_list),
+                max(int(x.shape[1]) for x in neg_list_encoded),
+            )
+            pos = torch.cat(_anima_v3_pad_condition_list(pos_list, target_len), dim=0)
+            neg = torch.cat(_anima_v3_pad_condition_list(neg_list_encoded, target_len), dim=0)
             return pos, neg
 
         pos = _anima_v3_encode_batch(
@@ -4315,7 +4332,7 @@ def get_weighted_text_embeddings_anima(
             )
 
         if enable_AND and (any(_has_top_level_AND(p or "") for p in prompt_list) or any(_has_top_level_AND(n or "") for n in neg_list)):
-            pos = torch.cat([
+            pos_list = [
                 _anima_v3_mix_AND(
                     pipe,
                     p or "",
@@ -4334,8 +4351,8 @@ def get_weighted_text_embeddings_anima(
                     long_prompt_anchor_tokens=long_prompt_anchor_tokens,
                 )
                 for p in prompt_list
-            ], dim=0)
-            neg = torch.cat([
+            ]
+            neg_list_encoded = [
                 _anima_v3_mix_AND(
                     pipe,
                     n or "",
@@ -4354,7 +4371,13 @@ def get_weighted_text_embeddings_anima(
                     long_prompt_anchor_tokens=long_prompt_anchor_tokens,
                 )
                 for n in neg_list
-            ], dim=0)
+            ]
+            target_len = max(
+                max(int(x.shape[1]) for x in pos_list),
+                max(int(x.shape[1]) for x in neg_list_encoded),
+            )
+            pos = torch.cat(_anima_v3_pad_condition_list(pos_list, target_len), dim=0)
+            neg = torch.cat(_anima_v3_pad_condition_list(neg_list_encoded, target_len), dim=0)
         else:
             pos = _anima_v3_encode_batch(
                 pipe,
@@ -4393,3 +4416,237 @@ def get_weighted_text_embeddings_anima(
         return pos, neg
     finally:
         dynamically_unscale_lora_layers(pipe, lora_scale=lora_scale)
+
+
+# ============================================================
+# Anima long-prompt BREAK-aware token packing override
+# ============================================================
+
+def _anima_v3_split_top_level_comma_items(text: str) -> List[str]:
+    text = text or ""
+    if not text:
+        return [""]
+    items: List[str] = []
+    buf: List[str] = []
+    par = brk = brace = 0
+    escape = False
+    for ch in text:
+        if escape:
+            buf.append(ch)
+            escape = False
+            continue
+        if ch == "\\":
+            buf.append(ch)
+            escape = True
+            continue
+        if ch == "(":
+            par += 1
+        elif ch == ")" and par > 0:
+            par -= 1
+        elif ch == "[":
+            brk += 1
+        elif ch == "]" and brk > 0:
+            brk -= 1
+        elif ch == "{":
+            brace += 1
+        elif ch == "}" and brace > 0:
+            brace -= 1
+        if ch == "," and par == 0 and brk == 0 and brace == 0:
+            items.append("".join(buf).strip())
+            buf = []
+            continue
+        buf.append(ch)
+    items.append("".join(buf).strip())
+    return items
+
+
+def _anima_v3_count_prompt_tokens_dual(qwen_tokenizer, t5_tokenizer, text: str, *, qwen_pad: int, t5_eos: int) -> Tuple[int, int]:
+    q_ids, _q_weights, _clean_q, _has_q = _anima_v3_tokenize_with_weights(
+        qwen_tokenizer,
+        text or "",
+        empty_token_id=int(qwen_pad),
+        add_eos=False,
+        eos_token_id=None,
+        truncate_to=None,
+    )
+    t_ids, _t_weights, _clean_t, _has_t = _anima_v3_tokenize_with_weights(
+        t5_tokenizer,
+        text or "",
+        empty_token_id=int(t5_eos),
+        add_eos=True,
+        eos_token_id=int(t5_eos),
+        truncate_to=None,
+    )
+    return len(q_ids), len(t_ids)
+
+
+def _anima_v3_pack_prompt_text_with_breaks(
+    qwen_tokenizer,
+    t5_tokenizer,
+    text: str,
+    *,
+    chunk_size: int,
+    break_token: str = "BREAK",
+) -> List[str]:
+    qwen_pad = getattr(qwen_tokenizer, "pad_token_id", None)
+    if qwen_pad is None:
+        qwen_pad = _ANIMA_QWEN3_DEFAULT_PAD_TOKEN_ID
+    t5_eos = getattr(t5_tokenizer, "eos_token_id", None)
+    if t5_eos is None:
+        t5_eos = 1
+
+    items = _anima_v3_split_top_level_comma_items(text or "")
+    out_chunks: List[str] = []
+    cur_items: List[str] = []
+
+    def join_items(parts: List[str]) -> str:
+        return ", ".join([p for p in parts if p is not None and str(p).strip() != ""])
+
+    def flush_current() -> None:
+        nonlocal cur_items
+        chunk_text = join_items(cur_items)
+        if chunk_text.strip():
+            out_chunks.append(chunk_text)
+        cur_items = []
+
+    def fits_text(candidate_text: str) -> bool:
+        q_len, t_len = _anima_v3_count_prompt_tokens_dual(
+            qwen_tokenizer,
+            t5_tokenizer,
+            candidate_text,
+            qwen_pad=int(qwen_pad),
+            t5_eos=int(t5_eos),
+        )
+        return q_len <= int(chunk_size) and t_len <= int(chunk_size)
+
+    for item in items:
+        stripped = (item or "").strip()
+        if not stripped:
+            continue
+        if stripped.upper() == str(break_token).upper():
+            flush_current()
+            continue
+
+        # Oversized single item: fall back to native weighted text splitter using
+        # actual tokenizer budgets. BREAK still acts as a hard boundary around it.
+        if not fits_text(stripped):
+            flush_current()
+            subchunks = _anima_v3_split_prompt_text_dual_budget(
+                qwen_tokenizer,
+                t5_tokenizer,
+                stripped,
+                chunk_size=int(chunk_size),
+            )
+            for sub in subchunks:
+                sub = (sub or "").strip()
+                if sub:
+                    out_chunks.append(sub)
+            continue
+
+        candidate_items = [*cur_items, stripped]
+        candidate_text = join_items(candidate_items)
+        if not cur_items or fits_text(candidate_text):
+            cur_items = candidate_items
+            continue
+
+        flush_current()
+        cur_items = [stripped]
+
+    flush_current()
+    return out_chunks or [text or ""]
+
+
+@torch.no_grad()
+def _anima_v3_encode_long_single(
+    pipe,
+    text: str,
+    *,
+    max_sequence_length: int,
+    qwen_weight_strength: float,
+    adapter_weight_strength: float,
+    weight_clamp_min: Optional[float],
+    weight_clamp_max: Optional[float],
+    long_prompt_strategy: str,
+    long_prompt_chunk_size: Optional[int],
+    long_prompt_chunk_decay: float,
+    long_prompt_strength: float,
+    long_prompt_anchor_tokens: int,
+) -> torch.Tensor:
+    _prompt_tokenizer, qwen_tokenizer, t5_tokenizer = _anima_v3_get_prompt_tokenizer(pipe)
+    qwen_pad = getattr(qwen_tokenizer, "pad_token_id", None)
+    if qwen_pad is None:
+        qwen_pad = _ANIMA_QWEN3_DEFAULT_PAD_TOKEN_ID
+    t5_eos = getattr(t5_tokenizer, "eos_token_id", None)
+    if t5_eos is None:
+        t5_eos = 1
+
+    q_ids, _q_weights, _clean_q, _has_q = _anima_v3_tokenize_with_weights(
+        qwen_tokenizer,
+        text or "",
+        empty_token_id=int(qwen_pad),
+        add_eos=False,
+        eos_token_id=None,
+        truncate_to=None,
+    )
+    t_ids, _t_weights, _clean_t, _has_t = _anima_v3_tokenize_with_weights(
+        t5_tokenizer,
+        text or "",
+        empty_token_id=int(t5_eos),
+        add_eos=True,
+        eos_token_id=int(t5_eos),
+        truncate_to=None,
+    )
+
+    chunk_size = _anima_v3_long_prompt_chunk_size(max_sequence_length, long_prompt_chunk_size)
+
+    if len(q_ids) <= chunk_size and len(t_ids) <= chunk_size:
+        qwen_hidden, t5_ids, t5_weights = _anima_v3_prepare_condition_inputs(
+            pipe,
+            [text or ""],
+            max_sequence_length=chunk_size,
+            qwen_weight_strength=qwen_weight_strength,
+            t5_weight_strength=adapter_weight_strength,
+            weight_clamp_min=weight_clamp_min,
+            weight_clamp_max=weight_clamp_max,
+        )
+        return _anima_v3_build_condition(
+            pipe,
+            qwen_hidden=qwen_hidden,
+            t5_ids=t5_ids,
+            t5_weights=t5_weights,
+        )
+
+    text_chunks = _anima_v3_pack_prompt_text_with_breaks(
+        qwen_tokenizer,
+        t5_tokenizer,
+        text or "",
+        chunk_size=chunk_size,
+        break_token="BREAK",
+    )
+
+    chunk_conditions: List[torch.Tensor] = []
+    for chunk_text in text_chunks:
+        qwen_hidden, t5_ids_t, t5_weights_t = _anima_v3_prepare_condition_inputs(
+            pipe,
+            [chunk_text or ""],
+            max_sequence_length=chunk_size,
+            qwen_weight_strength=qwen_weight_strength,
+            t5_weight_strength=adapter_weight_strength,
+            weight_clamp_min=weight_clamp_min,
+            weight_clamp_max=weight_clamp_max,
+        )
+        chunk_conditions.append(_anima_v3_build_condition(
+            pipe,
+            qwen_hidden=qwen_hidden,
+            t5_ids=t5_ids_t,
+            t5_weights=t5_weights_t,
+            target_length=_ANIMA_CONDITIONING_MAX_LENGTH,
+        ))
+
+    return _anima_v3_fuse_long_prompt_conditions(
+        chunk_conditions,
+        strength=long_prompt_strength,
+        chunk_decay=long_prompt_chunk_decay,
+        mode=long_prompt_strategy,
+        anchor_tokens=long_prompt_anchor_tokens,
+    )
