@@ -8,9 +8,11 @@ This file implements the same high-level syntax as the ComfyUI node:
     @artist:[style:1.0, face:0.4, eyes pose:0.7]
 
 It patches Anima/MiniTrainDIT cross-attention modules and routes every artist to
-Anima L00-L27 blocks according to the requested component. The script is designed
-as a safe adapter: if your Diffusers Anima implementation uses different module
-names, pass custom `blocks_getter` / `cross_attn_getter` callbacks.
+the active Anima transformer depth according to the requested component. The
+original 28-block layout and the expanded 40-block Anima 2.9B layout are mapped
+semantically so inserted blocks inherit the role of their source block. The script
+is designed as a safe adapter: if your Diffusers Anima implementation uses different
+module names, pass custom `blocks_getter` / `cross_attn_getter` callbacks.
 
 Important: non-cross-attention elements are not directly re-encoded in this
 Diffusers version. Artist text affects the model through per-layer cross-attn
@@ -66,7 +68,7 @@ def _merge_layer_maps(*maps: Dict[int, float]) -> Dict[int, float]:
     return out
 
 
-_COMPONENT_LAYER_MAP: Dict[str, Dict[int, float]] = {
+_BASE_COMPONENT_LAYER_MAP: Dict[str, Dict[int, float]] = {
     "global": _merge_layer_maps(_layer_range(0, 27, 1.0)),
     "style": _merge_layer_maps(_layer_range(0, 27, 0.20), _layer_range(14, 21, 0.45), _layer_range(22, 24, 0.95), _layer_range(25, 27, 1.15)),
     "paint": _merge_layer_maps(_layer_range(14, 17, 0.35), _layer_range(18, 21, 0.70), _layer_range(22, 27, 1.10)),
@@ -84,6 +86,62 @@ _COMPONENT_LAYER_MAP: Dict[str, Dict[int, float]] = {
     "clothes": _merge_layer_maps(_layer_range(3, 8, 1.00), _layer_range(9, 13, 0.55), _layer_range(22, 24, 0.30)),
     "background": _merge_layer_maps(_layer_range(2, 3, 0.80), _layer_range(22, 24, 1.00), _layer_range(25, 27, 0.45)),
 }
+
+
+# Anima 2.9B expands the original 28 main blocks to 40. The inserted blocks are
+# derived from the source blocks listed in expanded_manifest, so component
+# routing inherits the source block's semantic weight instead of stopping at L27.
+_ANIMA_29B_INSERTED_TO_SOURCE: Dict[int, int] = {
+    2: 1, 5: 3, 8: 5, 11: 7, 14: 9, 17: 11,
+    21: 14, 24: 16, 27: 18, 30: 20, 33: 22, 36: 24,
+}
+
+
+def _expanded_29b_source_map() -> Dict[int, int]:
+    source_for_block: Dict[int, int] = {}
+    source_index = 0
+    for block_index in range(40):
+        if block_index in _ANIMA_29B_INSERTED_TO_SOURCE:
+            source_for_block[block_index] = _ANIMA_29B_INSERTED_TO_SOURCE[block_index]
+        else:
+            source_for_block[block_index] = source_index
+            source_index += 1
+    if source_index != 28:
+        raise RuntimeError("Invalid Anima 2.9B block mapping")
+    return source_for_block
+
+
+_ANIMA_29B_SOURCE_FOR_BLOCK = _expanded_29b_source_map()
+
+
+def _component_layer_map_for_depth(num_blocks: int) -> Dict[str, Dict[int, float]]:
+    """Project the original 28-block component map onto the active architecture."""
+    if num_blocks <= 0:
+        return {name: {} for name in _BASE_COMPONENT_LAYER_MAP}
+    if num_blocks == 28:
+        return _BASE_COMPONENT_LAYER_MAP
+
+    if num_blocks == 40:
+        source_for_block = _ANIMA_29B_SOURCE_FOR_BLOCK
+    else:
+        # Future-compatible fallback: preserve relative depth roles rather than
+        # silently leaving all blocks above L27 inactive.
+        if num_blocks == 1:
+            source_for_block = {0: 0}
+        else:
+            source_for_block = {
+                i: int(round(i * 27.0 / float(num_blocks - 1)))
+                for i in range(num_blocks)
+            }
+
+    projected: Dict[str, Dict[int, float]] = {}
+    for component, baseline in _BASE_COMPONENT_LAYER_MAP.items():
+        projected[component] = {
+            block_index: float(baseline.get(source_index, 0.0))
+            for block_index, source_index in source_for_block.items()
+            if float(baseline.get(source_index, 0.0)) != 0.0
+        }
+    return projected
 
 
 @dataclass
@@ -179,7 +237,7 @@ def _safe_float(value: Any, default: float = 1.0, lo: float = 0.0, hi: float = 4
 
 def _normalize_component_name(name: str) -> Optional[str]:
     key = str(name or '').strip().lower().replace('-', '_')
-    return _COMPONENT_ALIASES.get(key, key if key in _COMPONENT_LAYER_MAP else None)
+    return _COMPONENT_ALIASES.get(key, key if key in _BASE_COMPONENT_LAYER_MAP else None)
 
 
 def _split_component_names(text: str) -> List[str]:
@@ -233,7 +291,7 @@ def parse_artist_mixer_syntax(chain: str) -> List[ArtistSpec]:
             name, rest = s[:colon].strip(), s[colon + 1:].strip()
             if rest.startswith('[') and rest.endswith(']'):
                 comps = _parse_component_items(rest[1:-1])
-                comps = {k: v * outer_weight for k, v in comps.items() if k in _COMPONENT_LAYER_MAP}
+                comps = {k: v * outer_weight for k, v in comps.items() if k in _BASE_COMPONENT_LAYER_MAP}
                 specs.append(ArtistSpec(name=name, components=comps or {"global": outer_weight}, explicit=True))
                 continue
             parts = _split_top_level(s, ':')
@@ -256,9 +314,10 @@ def parse_artist_mixer_syntax(chain: str) -> List[ArtistSpec]:
 
 def build_layer_artist_weights(specs: Sequence[ArtistSpec], num_blocks: int) -> Dict[int, List[float]]:
     layer_artist_weights = {i: [0.0] * len(specs) for i in range(num_blocks)}
+    component_layer_map = _component_layer_map_for_depth(num_blocks)
     for artist_idx, spec in enumerate(specs):
         for comp, ratio in spec.components.items():
-            for layer, lw in _COMPONENT_LAYER_MAP.get(comp, {}).items():
+            for layer, lw in component_layer_map.get(comp, {}).items():
                 if 0 <= layer < num_blocks:
                     layer_artist_weights[layer][artist_idx] += float(ratio) * float(lw)
     for layer in range(num_blocks):
@@ -402,11 +461,19 @@ def _default_find_transformer(pipe: Any) -> Any:
 
 def _default_get_blocks(pipe: Any) -> Sequence[Any]:
     root = _default_find_transformer(pipe)
-    for name in ("blocks", "transformer_blocks", "layers", "joint_transformer_blocks"):
-        blocks = getattr(root, name, None)
-        if blocks is not None and len(blocks) > 0:
-            return blocks
-    raise AttributeError("Could not find blocks/transformer_blocks/layers on pipeline transformer. Pass blocks_getter.")
+    candidates = [root]
+    core = getattr(root, "core", None)
+    if core is not None:
+        candidates.append(core)
+    for candidate in candidates:
+        for name in ("blocks", "transformer_blocks", "layers", "joint_transformer_blocks"):
+            blocks = getattr(candidate, name, None)
+            if blocks is not None and len(blocks) > 0:
+                return blocks
+    raise AttributeError(
+        "Could not find blocks/transformer_blocks/layers on pipeline transformer "
+        "or transformer.core. Pass blocks_getter."
+    )
 
 
 def _default_cross_attn_getter(block: Any) -> Tuple[str, nn.Module]:
