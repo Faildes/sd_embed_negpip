@@ -1,5 +1,10 @@
 # Stable Diffusion Long Prompt Weighted Embedding
 
+## Anima architecture compatibility
+
+The Anima integration supports both the original 28-block Diffusers-Anima transformer and the expanded 40-block Anima 2.9B architecture. Artist Mixer routing automatically follows `transformer.core.transformer_blocks`; for Anima 2.9B, inserted blocks inherit the semantic component weights of their source blocks instead of being ignored above L27.
+
+
 - [Stable Diffusion Long Prompt Weighted Embedding](#stable-diffusion-long-prompt-weighted-embedding)
   - [Updates](#updates)
   - [Install](#install)
