@@ -40,8 +40,20 @@ from typing import TypeVar
 from typing import Union
 import gc
 import logging
+from pathlib import Path
 import typing
 import traceback
+
+try:
+    from sd_embed.anima_semantic_prompt import (
+        AnimaSemanticPromptFrontend,
+        SemanticPromptResult,
+        TagLexiconResolver,
+    )
+except Exception:
+    AnimaSemanticPromptFrontend = None
+    SemanticPromptResult = None
+    TagLexiconResolver = None
 
 logger = logging.getLogger(__name__)
 
@@ -2557,6 +2569,180 @@ def _mix_AND_anima(
     return base + (mixed - base) * float(and_strength)
 
 
+
+
+def _anima_format_weight_value(value: float) -> str:
+    text = f"{float(value):.6f}".rstrip("0").rstrip(".")
+    return text or "1"
+
+
+def _anima_semantic_make_frontend(
+    pipe,
+    *,
+    mode: str,
+    target_t5_tokens: int,
+    qwen_input_max_tokens: int,
+    compiler_max_new_tokens: int,
+    system_prompt: Optional[str],
+    tag_resolver: Optional[Any],
+    tag_resolver_path: Optional[Union[str, Path]],
+    process_negative_prompt: bool,
+    generation_kwargs: Optional[Dict[str, Any]],
+):
+    if AnimaSemanticPromptFrontend is None:
+        raise ImportError(
+            "anima_semantic_prompt.py is required for enable_semantic=True. "
+            "Place it next to embedding_funcs.py or install it on PYTHONPATH."
+        )
+    resolver_obj = tag_resolver
+    if resolver_obj is None and tag_resolver_path:
+        if TagLexiconResolver is None:
+            raise ImportError("TagLexiconResolver is unavailable; cannot load semantic tag resolver JSON.")
+        resolver_obj = TagLexiconResolver.from_json(Path(tag_resolver_path))
+    kwargs: Dict[str, Any] = {
+        "mode": mode,
+        "target_t5_tokens": int(target_t5_tokens),
+        "qwen_input_max_tokens": int(qwen_input_max_tokens),
+        "compiler_max_new_tokens": int(compiler_max_new_tokens),
+        "tag_resolver": resolver_obj,
+        "process_negative_prompt": bool(process_negative_prompt),
+    }
+    if system_prompt is not None:
+        kwargs["system_prompt"] = str(system_prompt)
+    if generation_kwargs is not None:
+        kwargs["generation_kwargs"] = dict(generation_kwargs)
+    return AnimaSemanticPromptFrontend(pipe, **kwargs)
+
+
+def _anima_semantic_has_attention_markup(text: str) -> bool:
+    s = str(text or "")
+    return any(ch in s for ch in ("(", ")", "[", "]", "{", "}"))
+
+
+def _anima_semantic_extract_uniform_attention(text: str) -> Optional[Tuple[str, float]]:
+    s = str(text or "").strip()
+    if not s:
+        return None
+    try:
+        parts = parse_prompt_attention(s)
+    except Exception:
+        return None
+    normalized_parts = [(str(piece or ""), float(weight)) for piece, weight in parts if str(piece or "")]
+    if not normalized_parts:
+        return None
+    weights = {round(weight, 6) for _piece, weight in normalized_parts}
+    if len(weights) != 1:
+        return None
+    merged = "".join(piece for piece, _weight in normalized_parts).strip()
+    if not merged:
+        return None
+    return merged, float(normalized_parts[0][1])
+
+
+def _anima_semantic_compile_text(frontend, text: str, *, negative: bool) -> str:
+    result = frontend.process_one(text, negative=negative)
+    return result.compiled if hasattr(result, "compiled") else str(result)
+
+
+def _anima_semantic_compile_item(frontend, item: str, *, negative: bool) -> str:
+    stripped = str(item or "").strip()
+    if not stripped:
+        return ""
+    if stripped.upper() == "BREAK":
+        return "BREAK"
+
+    uniform = _anima_semantic_extract_uniform_attention(stripped)
+    if uniform is not None:
+        core, weight = uniform
+        compiled = _anima_semantic_compile_text(frontend, core, negative=negative).strip()
+        if abs(float(weight) - 1.0) < 1e-6:
+            return compiled
+        return f"({compiled}:{_anima_format_weight_value(weight)})"
+
+    # Mixed inline weighting inside one comma item is difficult to rewrite safely.
+    # Preserve the original item rather than risking weight / scope corruption.
+    if _anima_semantic_has_attention_markup(stripped):
+        return stripped
+
+    return _anima_semantic_compile_text(frontend, stripped, negative=negative).strip()
+
+
+def _anima_semantic_compile_section(frontend, text: str, *, negative: bool) -> str:
+    stripped = str(text or "").strip()
+    if not stripped:
+        return ""
+
+    # Fast path: no attention syntax in the whole section, so let the semantic
+    # compiler see the full clause for better relation understanding.
+    if not _anima_semantic_has_attention_markup(stripped):
+        return _anima_semantic_compile_text(frontend, stripped, negative=negative).strip()
+
+    items = _anima_v3_split_top_level_comma_items(stripped)
+    compiled_items: List[str] = []
+    for item in items:
+        compiled = _anima_semantic_compile_item(frontend, item, negative=negative).strip()
+        if compiled:
+            compiled_items.append(compiled)
+    return ", ".join(compiled_items)
+
+
+def _anima_semantic_compile_break_aware(frontend, text: str, *, negative: bool) -> str:
+    items = _anima_v3_split_top_level_comma_items(str(text or ""))
+    if not items:
+        return ""
+    sections: List[str] = []
+    current_items: List[str] = []
+
+    def flush_current() -> None:
+        nonlocal current_items
+        section_text = ", ".join([it.strip() for it in current_items if str(it).strip()])
+        compiled = _anima_semantic_compile_section(frontend, section_text, negative=negative).strip()
+        if compiled:
+            sections.append(compiled)
+        current_items = []
+
+    saw_break = False
+    for item in items:
+        stripped = str(item or "").strip()
+        if not stripped:
+            continue
+        if stripped.upper() == "BREAK":
+            flush_current()
+            sections.append("BREAK")
+            saw_break = True
+            continue
+        current_items.append(stripped)
+    flush_current()
+    if not saw_break:
+        return sections[0] if len(sections) == 1 else ", ".join(sections)
+    out_items: List[str] = []
+    for section in sections:
+        if section == "BREAK":
+            if out_items and out_items[-1] != "BREAK":
+                out_items.append("BREAK")
+            continue
+        out_items.append(section)
+    return ", ".join(out_items).strip(", ")
+
+
+def _anima_semantic_compile_prompt(frontend, text: str, *, negative: bool) -> str:
+    raw = str(text or "").strip()
+    if not raw:
+        return raw
+    if _has_top_level_AND(raw):
+        compiled_segments: List[str] = []
+        for segment in _split_top_level_AND(raw):
+            segment_text, segment_weight = _split_suffix_weight_top_level(segment)
+            compiled = _anima_semantic_compile_break_aware(frontend, segment_text, negative=negative).strip()
+            if not compiled:
+                compiled = str(segment_text or "").strip()
+            if abs(float(segment_weight) - 1.0) >= 1e-6:
+                compiled = f"{compiled}:{_anima_format_weight_value(segment_weight)}"
+            compiled_segments.append(compiled)
+        return " AND ".join(seg for seg in compiled_segments if str(seg).strip())
+    return _anima_semantic_compile_break_aware(frontend, raw, negative=negative)
+
+
 @torch.no_grad()
 def get_weighted_text_embeddings_anima(
     pipe,
@@ -3877,6 +4063,18 @@ def get_weighted_text_embeddings_anima(
     enable_AND: bool = True,
     and_strength: float = 0.60,
     base_bias: float = 4.0,
+    # Semantic prompt compilation options
+    enable_semantic: bool = False,
+    semantic_frontend: Optional[Any] = None,
+    semantic_mode: str = "auto",
+    semantic_target_t5_tokens: int = 480,
+    semantic_qwen_input_max_tokens: int = 8192,
+    semantic_compiler_max_new_tokens: int = 640,
+    semantic_system_prompt: Optional[str] = None,
+    semantic_tag_resolver: Optional[Any] = None,
+    semantic_tag_resolver_path: Optional[Union[str, Path]] = None,
+    semantic_process_negative: bool = False,
+    semantic_generation_kwargs: Optional[Dict[str, Any]] = None,
     enable_long_prompt: bool = True,
     long_prompt_strategy: str = _ANIMA_LONG_PROMPT_FUSION_CHUNK_CONCAT,
     long_prompt_chunk_size: Optional[int] = None,
@@ -4276,6 +4474,13 @@ def get_weighted_text_embeddings_anima(
 ) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, Any]]:
     """Return Anima positive/negative conditioning with optional Artist Mixer.
 
+    `enable_semantic=True` integrates the inference-only Qwen3.5 semantic prompt
+    compiler into the weighted Anima path. The semantic stage runs *before* the
+    existing LPW/AND/long-prompt encoder so the final conditioning still comes
+    from `get_weighted_text_embeddings_anima`, but top-level `AND`, `BREAK`,
+    pure weighted items like `(red hair:1.4)`, and Artist Mixer syntax are
+    preserved structurally.
+
     `enable_artist_mixer=True` extracts top-level Artist Mixer syntax from the
     positive prompt and installs a transformer patch that remains active for the
     following pipeline call.  Call `uninstall_anima_artist_mixer(pipe)` after
@@ -4303,6 +4508,30 @@ def get_weighted_text_embeddings_anima(
             # Explicit mixer string means: install the patch, but do not force users
             # to put the mixer syntax in the visible prompt.
             enable_artist_mixer = True
+
+        if enable_semantic:
+            semantic_compiler = semantic_frontend
+            if semantic_compiler is None:
+                semantic_compiler = _anima_semantic_make_frontend(
+                    pipe,
+                    mode=semantic_mode,
+                    target_t5_tokens=semantic_target_t5_tokens,
+                    qwen_input_max_tokens=semantic_qwen_input_max_tokens,
+                    compiler_max_new_tokens=semantic_compiler_max_new_tokens,
+                    system_prompt=semantic_system_prompt,
+                    tag_resolver=semantic_tag_resolver,
+                    tag_resolver_path=semantic_tag_resolver_path,
+                    process_negative_prompt=semantic_process_negative,
+                    generation_kwargs=semantic_generation_kwargs,
+                )
+            prompt_list = [
+                _anima_semantic_compile_prompt(semantic_compiler, p or "", negative=False)
+                for p in prompt_list
+            ]
+            neg_list = [
+                _anima_semantic_compile_prompt(semantic_compiler, n or "", negative=True)
+                for n in neg_list
+            ]
 
         if enable_artist_mixer and mixer_syntax:
             base_for_artist = prompt_list[0] if prompt_list else ""

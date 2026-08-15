@@ -546,3 +546,39 @@ If you use `sd_embed` in your research, please cite the following work:
   year         = {2024},
 }
 ```
+
+## Anima semantic prompt frontend (Qwen3.5 / Anima 2.9B)
+
+`AnimaSemanticPromptFrontend` is an inference-only frontend for the matching
+`diffusers-anima` prompt-processor hook. It reuses the pipeline's already-loaded
+Qwen3.5 model for prompt compilation, targets 480 T5 tokens by default (leaving
+headroom under Anima's 512-position conditioning contract), and can optionally
+resolve booru/e621 aliases, implications, and visual descriptions from a local
+JSON lexicon. No trainable adapter or fourth model is added.
+
+```python
+from sd_embed import AnimaSemanticPromptFrontend, TagLexiconResolver
+
+frontend = AnimaSemanticPromptFrontend(
+    pipe,
+    mode="auto",                 # direct / compile / hybrid / auto
+    target_t5_tokens=480,
+    qwen_input_max_tokens=8192,
+    tag_resolver=TagLexiconResolver.from_json("tags.json"),
+).install()
+
+image = pipe("A long natural-language scene description ...").images[0]
+```
+
+Lexicon JSON format:
+
+```json
+{
+  "aliases": {"alias_tag": "canonical_tag"},
+  "implications": {"canonical_tag": ["visual_parent"]},
+  "descriptions": {"canonical_tag": "short visible description"}
+}
+```
+
+If the loaded Qwen object does not expose `generate`, the frontend falls back to
+deterministic alias resolution, de-duplication, and phrase-aware token budgeting.
