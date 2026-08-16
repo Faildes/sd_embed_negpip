@@ -582,3 +582,18 @@ Lexicon JSON format:
 
 If the loaded Qwen object does not expose `generate`, the frontend falls back to
 deterministic alias resolution, de-duplication, and phrase-aware token budgeting.
+
+
+### Anima / Anima 2.9B with either Qwen Base encoder
+
+The Anima weighted-embedding path supports both Qwen Base families independently
+of image-transformer depth:
+
+- 28-block Anima + Qwen3-0.6B-Base
+- 28-block Anima + Qwen3.5-0.8B-Base
+- 40-block Anima 2.9B + Qwen3-0.6B-Base
+- 40-block Anima 2.9B + Qwen3.5-0.8B-Base
+
+No filename or SHA256 allow-list is required. `sd_embed` resolves the actual
+hidden-state backbone so both bare Qwen3 encoders and Qwen3.5 causal/text wrappers
+produce the 1024-dimensional source conditioning expected by the Anima LLM adapter.

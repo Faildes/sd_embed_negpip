@@ -1,10 +1,10 @@
 """Inference-only semantic prompt frontend for Anima / Anima 2.9B.
 
 The frontend keeps the image model's learned 512-token conditioning contract
-intact while allowing a Qwen3.5 text model to read a much longer user prompt,
+intact while allowing the selected Qwen Base text encoder to read the user prompt,
 resolve optional booru/e621 aliases, and compile it into a compact hybrid prompt.
 
-No trainable parameters are introduced.  The same Qwen3.5 model already loaded
+No trainable parameters are introduced.  The same Qwen model already loaded
 by the Anima pipeline is reused for prompt compilation when it exposes
 ``generate``.  If only an encoder backbone is available, the frontend falls
 back to deterministic tag/segment budgeting.
@@ -170,6 +170,8 @@ class AnimaSemanticPromptFrontend:
 
     Parameters are intentionally inference-only.  ``target_t5_tokens`` defaults
     to 480 to leave headroom under Anima's learned 512-token conditioning limit.
+    Qwen3-0.6B-Base and Qwen3.5-0.8B-Base profiles are both supported and are
+    independent of whether the image transformer has 28 or 40 main blocks.
     """
 
     def __init__(

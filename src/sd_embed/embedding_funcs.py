@@ -2268,6 +2268,26 @@ def _pick_weighted_segments_for_mix(
     return [(t, w) for _, t, w in cand]
 
 
+def _anima_v3_resolve_text_encoder_backbone(text_encoder):
+    """Return the hidden-state backbone for supported Anima Qwen encoders.
+
+    Original Anima commonly exposes Qwen3-0.6B-Base as a bare Qwen3Model, while
+    Qwen3.5-0.8B-Base may be exposed through a causal-LM wrapper whose `.model`
+    is the actual text backbone. This is intentionally independent from the
+    28/40-block image-transformer selection.
+    """
+    direct = getattr(text_encoder, "language_model", None)
+    if direct is not None:
+        return direct
+    model = getattr(text_encoder, "model", None)
+    nested = getattr(model, "language_model", None) if model is not None else None
+    if nested is not None:
+        return nested
+    if model is not None and hasattr(model, "layers") and hasattr(model, "embed_tokens"):
+        return model
+    return text_encoder
+
+
 @torch.no_grad()
 def _anima_encode_direct_if_possible(
     pipe,
@@ -2350,7 +2370,8 @@ def _anima_encode_direct_if_possible(
         empty_qwen_mask = empty_qwen.attention_mask.to(device)
         empty_t5_ids = empty_t5.input_ids.to(device)
 
-        empty_qwen_out = text_encoder(
+        text_backbone = _anima_v3_resolve_text_encoder_backbone(text_encoder)
+        empty_qwen_out = text_backbone(
             input_ids=empty_qwen_ids,
             attention_mask=empty_qwen_mask,
         )
@@ -2364,7 +2385,8 @@ def _anima_encode_direct_if_possible(
 
     empty_qwen_hidden, empty_adapted = cache[cache_key]
 
-    qwen_outputs = text_encoder(
+    text_backbone = _anima_v3_resolve_text_encoder_backbone(text_encoder)
+    qwen_outputs = text_backbone(
         input_ids=qwen_input_ids,
         attention_mask=qwen_attention_mask,
     )
@@ -3230,7 +3252,8 @@ def _anima_v3_prepare_condition_inputs(
         enable_offload=enable_offload,
     ):
         with torch.inference_mode():
-            out = text_encoder(input_ids=qwen_ids, attention_mask=qwen_mask)
+            text_backbone = _anima_v3_resolve_text_encoder_backbone(text_encoder)
+            out = text_backbone(input_ids=qwen_ids, attention_mask=qwen_mask)
             if isinstance(out, tuple):
                 qwen_hidden = out[0]
             else:
@@ -3407,7 +3430,8 @@ def _anima_v3_prepare_condition_inputs_from_token_batches(
         enable_offload=enable_offload,
     ):
         with torch.inference_mode():
-            out = text_encoder(input_ids=qwen_ids, attention_mask=qwen_mask)
+            text_backbone = _anima_v3_resolve_text_encoder_backbone(text_encoder)
+            out = text_backbone(input_ids=qwen_ids, attention_mask=qwen_mask)
             if isinstance(out, tuple):
                 qwen_hidden = out[0]
             else:
@@ -4474,7 +4498,7 @@ def get_weighted_text_embeddings_anima(
 ) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, Any]]:
     """Return Anima positive/negative conditioning with optional Artist Mixer.
 
-    `enable_semantic=True` integrates the inference-only Qwen3.5 semantic prompt
+    `enable_semantic=True` integrates the inference-only Qwen Base semantic prompt
     compiler into the weighted Anima path. The semantic stage runs *before* the
     existing LPW/AND/long-prompt encoder so the final conditioning still comes
     from `get_weighted_text_embeddings_anima`, but top-level `AND`, `BREAK`,

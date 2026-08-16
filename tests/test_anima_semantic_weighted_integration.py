@@ -64,3 +64,28 @@ def test_semantic_break_boundary_is_preserved():
         negative=False,
     )
     assert compiled == "1girl, left side, BREAK, city skyline, night"
+
+
+class _BareQwen3:
+    pass
+
+
+class _Qwen35Backbone:
+    def __init__(self):
+        self.layers = []
+        self.embed_tokens = object()
+
+
+class _Qwen35CausalWrapper:
+    def __init__(self):
+        self.model = _Qwen35Backbone()
+
+
+def test_text_encoder_backbone_accepts_bare_qwen3_and_qwen35_wrapper():
+    from sd_embed.embedding_funcs import _anima_v3_resolve_text_encoder_backbone
+
+    qwen3 = _BareQwen3()
+    qwen35 = _Qwen35CausalWrapper()
+
+    assert _anima_v3_resolve_text_encoder_backbone(qwen3) is qwen3
+    assert _anima_v3_resolve_text_encoder_backbone(qwen35) is qwen35.model
