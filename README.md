@@ -558,3 +558,10 @@ long-prompt chunk or `AND` branch before mixing them.
 
 The legacy Anima chunk/mix path remains available for compatibility by passing
 `use_prompt_plan=False`.
+
+For Qwen3.5 prompt-plan use, sd_embed now expects the pipeline to expose an
+attached Anima encoder-compatibility profile by default. A v2 self-contained
+aligned encoder also satisfies this requirement automatically. Set
+`require_aligned_text_encoder=False` only for deliberate raw Qwen3.5 A/B tests.
+Prompt plans are tagged as version 2 single-memory plans and never invoke
+semantic rewriting or text-budget compression.

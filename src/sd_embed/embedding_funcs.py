@@ -4342,6 +4342,9 @@ def _anima_build_prompt_plan(
         "spans": spans,
         "metadata": {
             "source": "sd_embed",
+            "prompt_plan_version": 2,
+            "conditioning_mode": "single_qwen_memory",
+            "preserve_full_text": True,
             "group_count": group_id + 1,
             "and_folded_into_spans": bool(len(top_parts) > 1),
         },
@@ -4387,6 +4390,30 @@ def _anima_encode_prompt_plans_if_supported(
     return encoder(pos_plans, neg_plans)
 
 
+def _anima_require_aligned_text_encoder(pipe, *, required: bool) -> None:
+    if not required:
+        return
+    describe = getattr(pipe, "describe_text_encoder_profile", None)
+    if callable(describe):
+        info = describe()
+        family = str(info.get("encoder_family", "unknown")).lower()
+        attached = bool(info.get("bridge_attached", False))
+        if family == "qwen3.5" and not attached:
+            raise RuntimeError(
+                "Qwen3.5 is active but no Anima encoder-compatibility profile is attached. "
+                "Load a v2 bridge profile with pipe.load_text_encoder_bridge(...), or use a "
+                "self-contained aligned-encoder profile as encoder_path."
+            )
+        return
+    text_encoder = getattr(pipe, "text_encoder", None)
+    family = str(getattr(text_encoder, "_anima_text_encoder_family", "unknown")).lower()
+    bridge = getattr(pipe, "text_encoder_bridge", None)
+    if family == "qwen3.5" and bridge is None:
+        raise RuntimeError(
+            "Qwen3.5 is active but the pipeline does not expose an attached Anima text-encoder bridge/profile."
+        )
+
+
 @torch.no_grad()
 def get_weighted_text_embeddings_anima(
     pipe,
@@ -4406,6 +4433,9 @@ def get_weighted_text_embeddings_anima(
     # New single-memory path. When the matching diffusers-anima patch is present,
     # this bypasses chunk/AND condition mixing and keeps the full Qwen source.
     use_prompt_plan: bool = True,
+    # Prevent accidental use of raw Qwen3.5 hidden states against the 0.6B-trained
+    # Anima adapter. Native Qwen3-0.6B does not require a bridge.
+    require_aligned_text_encoder: bool = True,
     # Long prompt options (legacy fallback only)
     enable_long_prompt: bool = True,
     long_prompt_strategy: str = _ANIMA_LONG_PROMPT_FUSION_CHUNK_CONCAT,
@@ -4484,6 +4514,9 @@ def get_weighted_text_embeddings_anima(
             )
 
         if use_prompt_plan:
+            _anima_require_aligned_text_encoder(
+                pipe, required=bool(require_aligned_text_encoder)
+            )
             planned = _anima_encode_prompt_plans_if_supported(
                 pipe,
                 prompt_list,
