@@ -4476,6 +4476,18 @@ def get_weighted_text_embeddings_anima(
     enable_AND: bool = True,
     and_strength: float = 0.60,
     base_bias: float = 4.0,
+    # Semantic prompt compilation options
+    enable_semantic: bool = False,
+    semantic_frontend: Optional[Any] = None,
+    semantic_mode: str = "auto",
+    semantic_target_t5_tokens: int = 480,
+    semantic_qwen_input_max_tokens: int = 8192,
+    semantic_compiler_max_new_tokens: int = 640,
+    semantic_system_prompt: Optional[str] = None,
+    semantic_tag_resolver: Optional[Any] = None,
+    semantic_tag_resolver_path: Optional[Union[str, Path]] = None,
+    semantic_process_negative: bool = False,
+    semantic_generation_kwargs: Optional[Dict[str, Any]] = None,
     # Long prompt options
     enable_long_prompt: bool = True,
     long_prompt_strategy: str = _ANIMA_LONG_PROMPT_FUSION_CHUNK_CONCAT,
