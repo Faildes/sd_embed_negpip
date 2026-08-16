@@ -79,3 +79,20 @@ def test_install_and_uninstall():
     assert pipe.processor is frontend
     frontend.uninstall()
     assert pipe.processor is None
+
+
+def test_base_semantic_generation_is_opt_in_even_when_over_budget():
+    class GenerateMustNotRun:
+        def generate(self, *args, **kwargs):
+            raise AssertionError("Base semantic generation must stay opt-in")
+
+    pipe = DummyPipe()
+    pipe.text_encoder = GenerateMustNotRun()
+    frontend = AnimaSemanticPromptFrontend(
+        pipe,
+        mode=PROMPT_MODE_DIRECT,
+        target_t5_tokens=32,
+    )
+    result = frontend.process_one(", ".join(f"tag_{i}" for i in range(100)))
+    assert result.used_generation is False
+    assert result.anima_t5_tokens <= 32

@@ -2609,6 +2609,7 @@ def _anima_semantic_make_frontend(
     tag_resolver: Optional[Any],
     tag_resolver_path: Optional[Union[str, Path]],
     process_negative_prompt: bool,
+    allow_generation: bool,
     generation_kwargs: Optional[Dict[str, Any]],
 ):
     if AnimaSemanticPromptFrontend is None:
@@ -2628,6 +2629,7 @@ def _anima_semantic_make_frontend(
         "compiler_max_new_tokens": int(compiler_max_new_tokens),
         "tag_resolver": resolver_obj,
         "process_negative_prompt": bool(process_negative_prompt),
+        "allow_generation": bool(allow_generation),
     }
     if system_prompt is not None:
         kwargs["system_prompt"] = str(system_prompt)
@@ -2983,13 +2985,23 @@ def _anima_v3_tokenize_with_weights(
     clean_text, spans, has_weight = _anima_v3_weighted_spans(prompt or "")
     if clean_text:
         try:
-            encoded = tokenizer(
-                [clean_text],
-                add_special_tokens=False,
-                truncation=False,
-                return_offsets_mapping=True,
-                return_tensors=None,
-            )
+            try:
+                encoded = tokenizer(
+                    [clean_text],
+                    add_special_tokens=False,
+                    truncation=False,
+                    return_offsets_mapping=True,
+                    return_tensors=None,
+                    verbose=False,
+                )
+            except TypeError:
+                encoded = tokenizer(
+                    [clean_text],
+                    add_special_tokens=False,
+                    truncation=False,
+                    return_offsets_mapping=True,
+                    return_tensors=None,
+                )
             ids = _anima_v3_flatten_ids(getattr(encoded, "input_ids", encoded.get("input_ids") if isinstance(encoded, dict) else []))
             offsets = _anima_v3_flatten_offsets(getattr(encoded, "offset_mapping", encoded.get("offset_mapping") if isinstance(encoded, dict) else []))
             weights = _anima_v3_weights_from_offsets(offsets, spans)
@@ -4098,6 +4110,7 @@ def get_weighted_text_embeddings_anima(
     semantic_tag_resolver: Optional[Any] = None,
     semantic_tag_resolver_path: Optional[Union[str, Path]] = None,
     semantic_process_negative: bool = False,
+    semantic_allow_generation: bool = False,
     semantic_generation_kwargs: Optional[Dict[str, Any]] = None,
     enable_long_prompt: bool = True,
     long_prompt_strategy: str = _ANIMA_LONG_PROMPT_FUSION_CHUNK_CONCAT,
@@ -4487,6 +4500,7 @@ def get_weighted_text_embeddings_anima(
     semantic_tag_resolver: Optional[Any] = None,
     semantic_tag_resolver_path: Optional[Union[str, Path]] = None,
     semantic_process_negative: bool = False,
+    semantic_allow_generation: bool = False,
     semantic_generation_kwargs: Optional[Dict[str, Any]] = None,
     # Long prompt options
     enable_long_prompt: bool = True,
@@ -4558,6 +4572,7 @@ def get_weighted_text_embeddings_anima(
                     tag_resolver=semantic_tag_resolver,
                     tag_resolver_path=semantic_tag_resolver_path,
                     process_negative_prompt=semantic_process_negative,
+                    allow_generation=semantic_allow_generation,
                     generation_kwargs=semantic_generation_kwargs,
                 )
             prompt_list = [

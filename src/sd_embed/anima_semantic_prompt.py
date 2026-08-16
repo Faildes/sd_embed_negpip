@@ -185,6 +185,7 @@ class AnimaSemanticPromptFrontend:
         system_prompt: str = _DEFAULT_SYSTEM_PROMPT,
         tag_resolver: TagLexiconResolver | None = None,
         process_negative_prompt: bool = False,
+        allow_generation: bool = False,
         generation_kwargs: Mapping[str, Any] | None = None,
     ) -> None:
         if mode not in _SUPPORTED_MODES:
@@ -201,6 +202,12 @@ class AnimaSemanticPromptFrontend:
         self.system_prompt = str(system_prompt)
         self.tag_resolver = tag_resolver
         self.process_negative_prompt = bool(process_negative_prompt)
+        # Base Qwen checkpoints are used as Anima text encoders.  They are not
+        # instruction-tuned prompt compilers, and autoregressive generation can
+        # take a long time before denoising starts (especially when Qwen3.5
+        # linear-attention kernels fall back to the torch implementation).
+        # Keep generation opt-in; deterministic resolver/budget processing stays on.
+        self.allow_generation = bool(allow_generation)
         self.generation_kwargs = dict(generation_kwargs or {})
         self.last_results: list[SemanticPromptResult] = []
 
@@ -237,12 +244,24 @@ class AnimaSemanticPromptFrontend:
             clearer()
 
     def _token_count(self, tokenizer: Any, text: str) -> int:
-        encoded = tokenizer(
-            str(text),
-            add_special_tokens=False,
-            truncation=False,
-            return_attention_mask=False,
-        )
+        # Tokenizers such as Anima's T5 resource advertise model_max_length=512.
+        # We intentionally count before applying the semantic budget, so silence
+        # the misleading HF warning here; this path does not run the model.
+        try:
+            encoded = tokenizer(
+                str(text),
+                add_special_tokens=False,
+                truncation=False,
+                return_attention_mask=False,
+                verbose=False,
+            )
+        except TypeError:
+            encoded = tokenizer(
+                str(text),
+                add_special_tokens=False,
+                truncation=False,
+                return_attention_mask=False,
+            )
         ids = getattr(encoded, "input_ids", None)
         if ids is None and isinstance(encoded, dict):
             ids = encoded.get("input_ids", [])
@@ -324,8 +343,10 @@ class AnimaSemanticPromptFrontend:
         return value.strip()
 
     def _generate_compile(self, text: str, mode: str) -> tuple[str, bool, int]:
-        model = getattr(self.pipe, "text_encoder", None)
         tokenizer = self.qwen_tokenizer
+        if not self.allow_generation:
+            return text, False, self._token_count(tokenizer, text)
+        model = getattr(self.pipe, "text_encoder", None)
         if model is None or not callable(getattr(model, "generate", None)):
             return text, False, self._token_count(tokenizer, text)
 
