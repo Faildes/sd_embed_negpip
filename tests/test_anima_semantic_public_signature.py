@@ -31,6 +31,7 @@ def test_final_anima_embedding_signature_exposes_semantic_and_artist_mixer_optio
         "semantic_tag_resolver_path",
         "semantic_process_negative",
         "semantic_generation_kwargs",
+        "semantic_compression_retries",
     }
     artist_mixer = {
         "enable_artist_mixer",

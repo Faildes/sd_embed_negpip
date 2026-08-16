@@ -33,14 +33,17 @@ _SUPPORTED_MODES = {
     PROMPT_MODE_HYBRID,
 }
 
-_DEFAULT_SYSTEM_PROMPT = """You are an image-generation prompt compiler for Anima.
-Rewrite the user's request into a compact hybrid prompt that preserves every visually
-important fact while removing prose, repetition, and non-visual filler. Prefer concise
-Danbooru/Gelbooru/e621-style tags when they are unambiguous, but keep short natural-language
-relations for spatial, action, counting, and subject-reference information that tags alone
-cannot express. Preserve names, species, clothing, body attributes, actions, camera,
-composition, lighting, environment, and style. Do not add facts. Do not explain your work.
-Return only the compiled prompt as comma/semicolon separated phrases."""
+_DEFAULT_SYSTEM_PROMPT = """You are an image-generation prompt compressor for Anima.
+Rewrite the user's request into one compact hybrid prompt suitable for Anima text conditioning.
+Keep only information explicitly present in the input. Do not invent facts, subjects, poses,
+or styles. Merge duplicates, synonyms, and repeated phrases. Keep one coherent interpretation,
+not multiple alternative compositions. Prefer concise Danbooru/Gelbooru/e621-style tags when
+unambiguous, but keep short natural-language relations for spatial, action, counting, and
+subject-reference information that tags alone cannot express. Preserve important information in
+this priority order: subject count and identity; visible appearance; clothing; action and pose;
+camera and composition; critical environment; lighting; style; decorative details. If the input
+is too long, remove the lowest-priority decorative details first. Mention the main subject only
+once when possible. Return only the final prompt as compact comma/semicolon separated phrases."""
 
 _TAG_SPLIT_RE = re.compile(r"\s*[,;\n]+\s*")
 _SENTENCE_HINT_RE = re.compile(r"[.!?。！？]|\b(?:is|are|was|were|with|while|behind|before|after|because|who|that)\b", re.I)
@@ -173,6 +176,11 @@ class AnimaSemanticPromptFrontend:
     to 480 to leave headroom under Anima's learned 512-token conditioning limit.
     Qwen3-0.6B-Base and Qwen3.5-0.8B-Base profiles are both supported and are
     independent of whether the image transformer has 28 or 40 main blocks.
+
+    ``target_t5_tokens`` is the *soft* joint semantic budget applied to both the
+    Qwen and T5 tokenizers after compression. The hard conditioning contract
+    remains 512 positions, but smaller soft budgets (for example 128-256) often
+    yield more stable Anima outputs than simply filling all 512 positions.
     """
 
     def __init__(
@@ -188,6 +196,7 @@ class AnimaSemanticPromptFrontend:
         process_negative_prompt: bool = False,
         allow_generation: bool = False,
         generation_kwargs: Mapping[str, Any] | None = None,
+        compression_retries: int = 1,
     ) -> None:
         if mode not in _SUPPORTED_MODES:
             raise ValueError(f"Unsupported prompt mode: {mode}")
@@ -210,6 +219,7 @@ class AnimaSemanticPromptFrontend:
         # Keep generation opt-in; deterministic resolver/budget processing stays on.
         self.allow_generation = bool(allow_generation)
         self.generation_kwargs = dict(generation_kwargs or {})
+        self.compression_retries = max(0, int(compression_retries))
         self.last_results: list[SemanticPromptResult] = []
 
     @property
@@ -302,14 +312,35 @@ class AnimaSemanticPromptFrontend:
         except Exception:
             return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    def _build_compiler_text(self, text: str, mode: str) -> str:
+    def _build_compiler_text(
+        self,
+        text: str,
+        mode: str,
+        *,
+        target_budget: int,
+        retry_index: int = 0,
+        previous_attempt: str | None = None,
+    ) -> str:
         instruction = self.system_prompt
+        instruction += (
+            f"\nTarget a compact result that fits within about {int(target_budget)} tokens under Anima's prompt budget."
+        )
         if mode == PROMPT_MODE_HYBRID:
             instruction += "\nThe input already contains useful tags: preserve them unless they are duplicates or aliases."
+        if retry_index > 0:
+            instruction += (
+                "\nPrevious output was still too long. Compress further while preserving the highest-priority visual facts."
+            )
         tokenizer = self.qwen_tokenizer
+        user_text = str(text)
+        if previous_attempt:
+            user_text += (
+                "\n\nPREVIOUS COMPACT PROMPT (still too long):\n"
+                f"{previous_attempt}\n\nPlease rewrite it even shorter."
+            )
         messages = [
             {"role": "system", "content": instruction},
-            {"role": "user", "content": text},
+            {"role": "user", "content": user_text},
         ]
         apply_chat_template = getattr(tokenizer, "apply_chat_template", None)
         if callable(apply_chat_template):
@@ -343,7 +374,15 @@ class AnimaSemanticPromptFrontend:
         value = re.sub(r"^(?:compiled prompt|prompt)\s*:\s*", "", value, flags=re.I)
         return value.strip()
 
-    def _generate_compile(self, text: str, mode: str) -> tuple[str, bool, int]:
+    def _generate_compile(
+        self,
+        text: str,
+        mode: str,
+        *,
+        target_budget: int,
+        retry_index: int = 0,
+        previous_attempt: str | None = None,
+    ) -> tuple[str, bool, int]:
         tokenizer = self.qwen_tokenizer
         if not self.allow_generation:
             return text, False, self._token_count(tokenizer, text)
@@ -351,7 +390,13 @@ class AnimaSemanticPromptFrontend:
         if model is None or not callable(getattr(model, "generate", None)):
             return text, False, self._token_count(tokenizer, text)
 
-        compiler_text = self._build_compiler_text(text, mode)
+        compiler_text = self._build_compiler_text(
+            text,
+            mode,
+            target_budget=target_budget,
+            retry_index=retry_index,
+            previous_attempt=previous_attempt,
+        )
         tokenized = tokenizer(
             compiler_text,
             return_tensors="pt",
@@ -389,19 +434,24 @@ class AnimaSemanticPromptFrontend:
         )
         return (decoded or text), bool(decoded), input_len
 
-    def _fits_final_budget(self, text: str) -> bool:
-        # The final prompt must fit the same textual content through both tokenizers.
-        # Use the existing T5 budget as the joint semantic budget; the hard model
-        # contract remains 512 and the default 480 leaves safety headroom.
-        budget = min(512, int(self.target_t5_tokens))
+    def _effective_budget(self, budget: int | None = None) -> int:
+        if budget is None:
+            budget = self.target_t5_tokens
+        return max(32, min(512, int(budget)))
+
+    def _fits_budget(self, text: str, *, budget: int | None = None) -> bool:
+        effective_budget = self._effective_budget(budget)
         return (
-            self._token_count(self.qwen_tokenizer, text) <= budget
-            and self._token_count(self.t5_tokenizer, text) <= budget
+            self._token_count(self.qwen_tokenizer, text) <= effective_budget
+            and self._token_count(self.t5_tokenizer, text) <= effective_budget
         )
 
-    def _fit_final_budget(self, text: str) -> str:
+    def _fits_final_budget(self, text: str) -> bool:
+        return self._fits_budget(text, budget=self.target_t5_tokens)
+
+    def _fit_budget(self, text: str, *, budget: int | None = None) -> str:
         text = str(text or "").strip()
-        if self._fits_final_budget(text):
+        if self._fits_budget(text, budget=budget):
             return text
 
         # Keep complete clauses in prompt-priority order. Do not skip an
@@ -411,7 +461,7 @@ class AnimaSemanticPromptFrontend:
         kept: list[str] = []
         for segment in segments:
             candidate = ", ".join([*kept, segment]).strip()
-            if self._fits_final_budget(candidate):
+            if self._fits_budget(candidate, budget=budget):
                 kept.append(segment)
                 continue
             break
@@ -435,12 +485,22 @@ class AnimaSemanticPromptFrontend:
             if not candidate:
                 lo = mid + 1
                 continue
-            if self._fits_final_budget(candidate):
+            if self._fits_budget(candidate, budget=budget):
                 best = candidate
                 lo = mid + 1
             else:
                 hi = mid - 1
         return best or text[:1]
+
+    def _fit_final_budget(self, text: str) -> str:
+        return self._fit_budget(text, budget=self.target_t5_tokens)
+
+    def _fit_hard_budget(self, text: str) -> str:
+        return self._fit_budget(text, budget=512)
+
+    def _retry_target_budget(self, retry_index: int) -> int:
+        base = self._effective_budget(self.target_t5_tokens)
+        return max(32, base - 32 * max(0, int(retry_index)))
 
     # Backward-compatible private alias used by older integrations/tests.
     def _fit_t5_budget(self, text: str) -> str:
@@ -466,12 +526,34 @@ class AnimaSemanticPromptFrontend:
         qwen_input_tokens = self._token_count(self.qwen_tokenizer, resolved)
         used_generation = False
         compiled = resolved
-        if mode in {PROMPT_MODE_COMPILE, PROMPT_MODE_HYBRID} or (
+        needs_compile = mode in {PROMPT_MODE_COMPILE, PROMPT_MODE_HYBRID} or (
             mode == PROMPT_MODE_DIRECT and not self._fits_final_budget(resolved)
-        ):
-            compiled, used_generation, qwen_input_tokens = self._generate_compile(resolved, mode)
+        )
+        if needs_compile:
+            target_budget = self._retry_target_budget(0)
+            compiled, used_generation, qwen_input_tokens = self._generate_compile(
+                resolved,
+                mode,
+                target_budget=target_budget,
+                retry_index=0,
+            )
+            previous = compiled
+            for retry_index in range(1, self.compression_retries + 1):
+                if self._fits_final_budget(previous):
+                    break
+                retry_budget = self._retry_target_budget(retry_index)
+                previous, generated, _ = self._generate_compile(
+                    previous,
+                    PROMPT_MODE_COMPILE,
+                    target_budget=retry_budget,
+                    retry_index=retry_index,
+                    previous_attempt=previous,
+                )
+                used_generation = used_generation or generated
+            compiled = previous
 
         compiled = self._fit_final_budget(compiled)
+        compiled = self._fit_hard_budget(compiled)
         return SemanticPromptResult(
             original=original,
             resolved=resolved,

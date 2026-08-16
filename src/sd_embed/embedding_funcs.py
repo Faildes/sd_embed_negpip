@@ -4194,6 +4194,7 @@ def get_weighted_text_embeddings_anima(
     semantic_process_negative: bool = False,
     semantic_allow_generation: bool = False,
     semantic_generation_kwargs: Optional[Dict[str, Any]] = None,
+    semantic_compression_retries: int = 1,
     enable_long_prompt: bool = True,
     long_prompt_strategy: str = _ANIMA_LONG_PROMPT_FUSION_STRICT_512,
     long_prompt_chunk_size: Optional[int] = None,
@@ -4584,6 +4585,7 @@ def get_weighted_text_embeddings_anima(
     semantic_process_negative: bool = False,
     semantic_allow_generation: bool = False,
     semantic_generation_kwargs: Optional[Dict[str, Any]] = None,
+    semantic_compression_retries: int = 1,
     # Long prompt options
     enable_long_prompt: bool = True,
     long_prompt_strategy: str = _ANIMA_LONG_PROMPT_FUSION_STRICT_512,
@@ -4661,6 +4663,7 @@ def get_weighted_text_embeddings_anima(
                     process_negative_prompt=semantic_process_negative,
                     allow_generation=semantic_allow_generation,
                     generation_kwargs=semantic_generation_kwargs,
+                    compression_retries=semantic_compression_retries,
                 )
             prompt_list = [
                 _anima_semantic_compile_prompt(semantic_compiler, p or "", negative=False)
