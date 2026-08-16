@@ -2627,6 +2627,7 @@ def _anima_semantic_make_frontend(
     process_negative_prompt: bool,
     allow_generation: bool,
     generation_kwargs: Optional[Dict[str, Any]],
+    compression_retries: int,
 ):
     if AnimaSemanticPromptFrontend is None:
         raise ImportError(
@@ -2646,6 +2647,7 @@ def _anima_semantic_make_frontend(
         "tag_resolver": resolver_obj,
         "process_negative_prompt": bool(process_negative_prompt),
         "allow_generation": bool(allow_generation),
+        "compression_retries": max(0, int(compression_retries)),
     }
     if system_prompt is not None:
         kwargs["system_prompt"] = str(system_prompt)
