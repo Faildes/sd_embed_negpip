@@ -2288,6 +2288,22 @@ def _anima_v3_resolve_text_encoder_backbone(text_encoder):
     return text_encoder
 
 
+def _anima_v3_text_encoder_source_scale(text_encoder) -> float:
+    """Mirror diffusers-anima's training-free Qwen3.5 compatibility gate."""
+    value = getattr(text_encoder, "_anima_conditioning_source_scale", None)
+    if value is None:
+        family = str(getattr(text_encoder, "_anima_text_encoder_family", ""))
+        model_type = str(getattr(getattr(text_encoder, "config", None), "model_type", ""))
+        value = 0.80 if family == "qwen3.5" or "qwen3_5" in model_type or "qwen3.5" in model_type else 1.0
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        value = 1.0
+    if not math.isfinite(value) or value < 0.0:
+        value = 1.0
+    return value
+
+
 @torch.no_grad()
 def _anima_encode_direct_if_possible(
     pipe,
@@ -2864,6 +2880,12 @@ _ANIMA_CONDITIONING_MAX_LENGTH = 512
 # dimension instead of compressing them back into a single 512-token tensor.
 # Older fusion modes are still kept as fallbacks/comparison strategies.
 _ANIMA_LONG_PROMPT_FUSION_CHUNK_CONCAT = "chunk_concat"
+# Explicit opt-in for the historical behavior that concatenated multiple native
+# 512-token Anima windows into 1024/1536/... conditioning tensors.  Anima is
+# trained around a 512-position conditioning contract, so the public
+# ``chunk_concat`` mode is now bounded/stabilized while ``raw_concat`` keeps the
+# old experimental behavior available for comparison.
+_ANIMA_LONG_PROMPT_FUSION_RAW_CONCAT = "raw_concat"
 _ANIMA_LONG_PROMPT_FUSION_CHUNK_BLEND = "chunk_blend"
 _ANIMA_LONG_PROMPT_FUSION_CHUNK_SLOTS = "chunk_slots"
 _ANIMA_LONG_PROMPT_FUSION_CHUNK_RESIDUAL = "chunk_residual"
@@ -3052,6 +3074,34 @@ def _anima_v3_scale_weight_tensor(
     return factor
 
 
+def _anima_v3_normalize_weight_energy(
+    factors: torch.Tensor,
+    mask: Optional[torch.Tensor] = None,
+    *,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Keep prompt weighting relative instead of increasing global condition energy.
+
+    LPW weights are intended to change *relative* token importance.  Multiplying
+    already-adapted Anima features by values such as 1.5--2.0 can otherwise move
+    the whole conditioning tensor far outside the native prompt distribution.
+    RMS-normalising active factors keeps unweighted prompts exactly unchanged
+    while retaining the requested emphasis ratios.
+    """
+    if mask is None:
+        active = torch.ones_like(factors)
+    else:
+        active = mask.to(device=factors.device, dtype=factors.dtype)
+        while active.ndim < factors.ndim:
+            active = active.unsqueeze(-1)
+        active = torch.broadcast_to(active, factors.shape)
+
+    denom = active.sum(dim=1, keepdim=True).clamp_min(1.0)
+    rms = ((factors.square() * active).sum(dim=1, keepdim=True) / denom).clamp_min(eps).sqrt()
+    normalized = factors / rms
+    return torch.where(active > 0, normalized, factors)
+
+
 def _anima_v3_apply_qwen_weights(
     qwen_hidden: torch.Tensor,
     qwen_weights: torch.Tensor,
@@ -3076,6 +3126,7 @@ def _anima_v3_apply_qwen_weights(
         clamp_min=clamp_min,
         clamp_max=clamp_max,
     )
+    factor = _anima_v3_normalize_weight_energy(factor, mask)
     # Padding positions should stay unchanged.
     factor = torch.where(mask > 0, factor, torch.ones_like(factor))
 
@@ -3255,6 +3306,9 @@ def _anima_v3_prepare_condition_inputs(
             clamp_min=weight_clamp_min,
             clamp_max=weight_clamp_max,
         )
+        scaled_t5_weights = _anima_v3_normalize_weight_energy(
+            scaled_t5_weights.unsqueeze(0)
+        ).squeeze(0)
         t5_weights_t[i, :t_len, :] = scaled_t5_weights
 
     with _anima_v3_module_execution_context(
@@ -3271,6 +3325,9 @@ def _anima_v3_prepare_condition_inputs(
             else:
                 qwen_hidden = out.last_hidden_state
             qwen_hidden = qwen_hidden.to(device=execution_device, dtype=model_dtype)
+            source_scale = _anima_v3_text_encoder_source_scale(text_encoder)
+            if source_scale != 1.0:
+                qwen_hidden = qwen_hidden * source_scale
             qwen_hidden = _anima_v3_apply_qwen_weights(
                 qwen_hidden,
                 qwen_weights_t,
@@ -3433,6 +3490,9 @@ def _anima_v3_prepare_condition_inputs_from_token_batches(
             clamp_min=weight_clamp_min,
             clamp_max=weight_clamp_max,
         )
+        scaled_t5_weights = _anima_v3_normalize_weight_energy(
+            scaled_t5_weights.unsqueeze(0)
+        ).squeeze(0)
         t5_weights_t[i, :t_len, :] = scaled_t5_weights
 
     with _anima_v3_module_execution_context(
@@ -3449,6 +3509,9 @@ def _anima_v3_prepare_condition_inputs_from_token_batches(
             else:
                 qwen_hidden = out.last_hidden_state
             qwen_hidden = qwen_hidden.to(device=execution_device, dtype=model_dtype)
+            source_scale = _anima_v3_text_encoder_source_scale(text_encoder)
+            if source_scale != 1.0:
+                qwen_hidden = qwen_hidden * source_scale
             qwen_hidden = _anima_v3_apply_qwen_weights(
                 qwen_hidden,
                 qwen_weights_t,
@@ -3651,14 +3714,42 @@ def _anima_v3_fuse_long_prompt_conditions(
     if not math.isfinite(decay) or decay <= 0:
         decay = 1.0
 
-    # CLIP/SDXL-style mode: keep each native chunk intact and concatenate them
-    # on the sequence axis. This avoids the overwrite/averaging problem that
-    # happens when multiple 512-token windows are compressed back into a single
-    # conditioning window.
-    if mode in (_ANIMA_LONG_PROMPT_FUSION_CHUNK_CONCAT, "clip_concat", "seq_concat"):
+    # Historical raw concatenation is intentionally opt-in.  It creates
+    # 1024/1536/... conditioning lengths that are outside Anima's learned
+    # 512-position contract and can manifest as duplicated faces, subjects or
+    # style leakage.
+    if mode in (_ANIMA_LONG_PROMPT_FUSION_RAW_CONCAT, "unsafe_concat", "legacy_concat"):
         return torch.cat([c.to(device=base.device, dtype=base.dtype) for c in conditions], dim=1)
 
-    # Legacy behavior kept for comparison/backward compatibility.
+    # ``chunk_concat`` remains the public/backward-compatible mode name, but is
+    # now *bounded*: later windows are injected as a low-gain residual into the
+    # first native 512-token window.  Per-channel statistics are matched to the
+    # first window before fusion, which keeps the model close to its native
+    # style/conditioning distribution while retaining useful tail information.
+    if mode in (_ANIMA_LONG_PROMPT_FUSION_CHUNK_CONCAT, "clip_concat", "seq_concat", "stable"):
+        conditions = _anima_v3_pad_condition_list(conditions, _ANIMA_CONDITIONING_MAX_LENGTH)
+        base = conditions[0]
+        rest = [
+            _anima_v3_match_condition_stats(c.to(device=base.device, dtype=base.dtype), base)
+            for c in conditions[1:]
+        ]
+        if not rest:
+            return base
+        weights = torch.tensor(
+            [decay ** i for i in range(len(rest))],
+            dtype=torch.float32,
+            device=base.device,
+        )
+        weights = weights / weights.sum().clamp_min(1e-6)
+        stacked = torch.stack(rest, dim=0)
+        tail = (stacked * weights.view(-1, 1, 1, 1).to(dtype=stacked.dtype)).sum(dim=0)
+        # 0.25 is deliberately conservative: long-prompt tail context should
+        # refine a native Anima condition, not replace it.
+        blend = max(0.0, min(0.5, 0.25 * s))
+        fused = base + (tail - base) * blend
+        return _anima_v3_match_condition_stats(fused, base)
+
+    # Legacy bounded fusion modes kept for comparison/backward compatibility.
     if mode == _ANIMA_LONG_PROMPT_FUSION_CHUNK_BLEND:
         conditions = _anima_v3_pad_condition_list(conditions)
         base = conditions[0]
@@ -3793,11 +3884,6 @@ def _anima_v3_encode_long_single(
     )
 
     chunk_conditions: List[torch.Tensor] = []
-    concat_mode = str(long_prompt_strategy or _ANIMA_LONG_PROMPT_FUSION_CHUNK_CONCAT).lower() in (
-        _ANIMA_LONG_PROMPT_FUSION_CHUNK_CONCAT,
-        "clip_concat",
-        "seq_concat",
-    )
     for chunk_text in text_chunks:
         qwen_hidden, t5_ids_t, t5_weights_t = _anima_v3_prepare_condition_inputs(
             pipe,
@@ -3813,9 +3899,9 @@ def _anima_v3_encode_long_single(
             qwen_hidden=qwen_hidden,
             t5_ids=t5_ids_t,
             t5_weights=t5_weights_t,
-            # Each long-prompt window should be a native Anima conditioning
-            # window.  Keeping 512 slots per chunk makes the returned seq_len
-            # reflect the number of recognised windows: 512, 1024, 1536, ...
+            # Every source chunk is encoded as a native Anima conditioning
+            # window.  The fusion stage keeps the public stable modes bounded
+            # to 512 positions; only explicit ``raw_concat`` may exceed it.
             target_length=_ANIMA_CONDITIONING_MAX_LENGTH,
         ))
 
@@ -4482,8 +4568,8 @@ def get_weighted_text_embeddings_anima(
     num_images_per_prompt: int = 1,
     max_sequence_length: int = 512,
     lora_scale: Optional[float] = None,
-    qwen_weight_strength: float = 1.25,
-    adapter_weight_strength: float = 1.75,
+    qwen_weight_strength: float = 0.60,
+    adapter_weight_strength: float = 0.80,
     weight_clamp_min: Optional[float] = 0.0,
     weight_clamp_max: Optional[float] = 3.0,
     enable_AND: bool = True,
@@ -4523,6 +4609,10 @@ def get_weighted_text_embeddings_anima(
     return_artist_mixer: bool = False,
 ) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, Any]]:
     """Return Anima positive/negative conditioning with optional Artist Mixer.
+
+    Stable defaults deliberately attenuate LPW strength (Qwen=0.60, adapter=0.80)
+    and keep ``chunk_concat`` inside Anima's native 512-position contract. Use
+    ``long_prompt_strategy="raw_concat"`` only for legacy experiments.
 
     `enable_semantic=True` integrates the inference-only Qwen Base semantic prompt
     compiler into the weighted Anima path. The semantic stage runs *before* the
