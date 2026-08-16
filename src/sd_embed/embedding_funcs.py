@@ -2785,8 +2785,119 @@ def _anima_semantic_compile_prompt(frontend, text: str, *, negative: bool) -> st
     return _anima_semantic_compile_break_aware(frontend, raw, negative=negative)
 
 
+def _anima_semantic_budget_debug_report(pipe, text: str, *, label: str = "prompt") -> Optional[str]:
+    prompt_tokenizer = getattr(pipe, "prompt_tokenizer", None)
+    if prompt_tokenizer is None:
+        return None
+    qwen_tok = getattr(prompt_tokenizer, "qwen_tokenizer", None)
+    t5_tok = getattr(prompt_tokenizer, "t5_tokenizer", None)
+    if qwen_tok is None or t5_tok is None:
+        return None
+    qwen_pad = getattr(qwen_tok, "pad_token_id", None)
+    if qwen_pad is None:
+        qwen_pad = _ANIMA_QWEN3_DEFAULT_PAD_TOKEN_ID
+    t5_eos = getattr(t5_tok, "eos_token_id", None)
+    if t5_eos is None:
+        t5_eos = 1
+    q_len, t_len = _anima_v3_count_prompt_tokens_dual(
+        qwen_tok,
+        t5_tok,
+        text or "",
+        qwen_pad=int(qwen_pad),
+        t5_eos=int(t5_eos),
+    )
+    return f"[Anima semantic] {label}: Qwen={q_len} T5={t_len}"
+
+
+def _anima_semantic_distribute_and_budgets(segment_weights: List[float], total_budget: int) -> List[int]:
+    n = len(segment_weights)
+    if n <= 0:
+        return []
+    total_budget = max(32, int(total_budget))
+    if n == 1:
+        return [total_budget]
+    connectors = 2 * (n - 1)
+    available = max(32 * n, total_budget - connectors)
+    weights = [max(abs(float(w)), 1e-6) for w in segment_weights]
+    denom = sum(weights) or float(n)
+    budgets = [max(32, int(available * (w / denom))) for w in weights]
+    current = sum(budgets)
+    i = 0
+    while current > available and any(b > 32 for b in budgets):
+        idx = i % n
+        if budgets[idx] > 32:
+            budgets[idx] -= 1
+            current -= 1
+        i += 1
+        if i > available * 4:
+            break
+    while current < available:
+        budgets[i % n] += 1
+        current += 1
+        i += 1
+        if i > available * 4:
+            break
+    return budgets
+
+
+def _anima_semantic_fit_global_budget(frontend, text: str, *, negative: bool) -> str:
+    raw = str(text or "").strip()
+    if not raw:
+        return raw
+    if not _has_top_level_AND(raw):
+        return frontend._fit_final_budget(raw)
+
+    parsed_segments: List[Tuple[str, float]] = []
+    for segment in _split_top_level_AND(raw):
+        segment_text, segment_weight = _split_suffix_weight_top_level(segment)
+        segment_text = str(segment_text or "").strip()
+        if segment_text:
+            parsed_segments.append((segment_text, float(segment_weight)))
+    if len(parsed_segments) <= 1:
+        return frontend._fit_final_budget(raw)
+
+    budgets = _anima_semantic_distribute_and_budgets(
+        [weight for _text, weight in parsed_segments],
+        int(getattr(frontend, "target_t5_tokens", 256)),
+    )
+    fitted_segments: List[str] = []
+    for (segment_text, segment_weight), seg_budget in zip(parsed_segments, budgets):
+        fitted = frontend._fit_budget(segment_text, budget=seg_budget).strip()
+        if not fitted:
+            fitted = frontend._fit_budget(segment_text, budget=max(32, seg_budget // 2)).strip()
+        if not fitted:
+            continue
+        if abs(float(segment_weight) - 1.0) >= 1e-6:
+            fitted = f"{fitted}:{_anima_format_weight_value(segment_weight)}"
+        fitted_segments.append(fitted)
+    joined = " AND ".join(seg for seg in fitted_segments if str(seg).strip())
+    if not joined:
+        return frontend._fit_final_budget(raw)
+    if frontend._fits_final_budget(joined):
+        return joined
+    # Final global guard: if connectors and residual phrasing still exceed the
+    # requested budget, fit each segment more aggressively and rebuild.
+    fallback_budgets = _anima_semantic_distribute_and_budgets(
+        [weight for _text, weight in parsed_segments],
+        max(32, int(getattr(frontend, "target_t5_tokens", 256)) - 32),
+    )
+    tighter_segments: List[str] = []
+    for (segment_text, segment_weight), seg_budget in zip(parsed_segments, fallback_budgets):
+        fitted = frontend._fit_budget(segment_text, budget=seg_budget).strip()
+        if not fitted:
+            continue
+        if abs(float(segment_weight) - 1.0) >= 1e-6:
+            fitted = f"{fitted}:{_anima_format_weight_value(segment_weight)}"
+        tighter_segments.append(fitted)
+    tighter_joined = " AND ".join(seg for seg in tighter_segments if str(seg).strip())
+    if tighter_joined and frontend._fits_final_budget(tighter_joined):
+        return tighter_joined
+    return frontend._fit_final_budget(tighter_joined or joined)
+
+
 @torch.no_grad()
 def get_weighted_text_embeddings_anima(
+
     pipe,
     prompt: Union[str, List[str]] = "",
     neg_prompt: Union[str, List[str]] = "",
@@ -4187,7 +4298,7 @@ def get_weighted_text_embeddings_anima(
     enable_semantic: bool = False,
     semantic_frontend: Optional[Any] = None,
     semantic_mode: str = "auto",
-    semantic_target_t5_tokens: int = 480,
+    semantic_target_t5_tokens: int = 256,
     semantic_qwen_input_max_tokens: int = 8192,
     semantic_compiler_max_new_tokens: int = 640,
     semantic_system_prompt: Optional[str] = None,
@@ -4578,7 +4689,7 @@ def get_weighted_text_embeddings_anima(
     enable_semantic: bool = False,
     semantic_frontend: Optional[Any] = None,
     semantic_mode: str = "auto",
-    semantic_target_t5_tokens: int = 480,
+    semantic_target_t5_tokens: int = 256,
     semantic_qwen_input_max_tokens: int = 8192,
     semantic_compiler_max_new_tokens: int = 640,
     semantic_system_prompt: Optional[str] = None,
@@ -4668,13 +4779,26 @@ def get_weighted_text_embeddings_anima(
                     compression_retries=semantic_compression_retries,
                 )
             prompt_list = [
-                _anima_semantic_compile_prompt(semantic_compiler, p or "", negative=False)
+                _anima_semantic_fit_global_budget(
+                    semantic_compiler,
+                    _anima_semantic_compile_prompt(semantic_compiler, p or "", negative=False),
+                    negative=False,
+                )
                 for p in prompt_list
             ]
             neg_list = [
-                _anima_semantic_compile_prompt(semantic_compiler, n or "", negative=True)
+                _anima_semantic_fit_global_budget(
+                    semantic_compiler,
+                    _anima_semantic_compile_prompt(semantic_compiler, n or "", negative=True),
+                    negative=True,
+                )
                 for n in neg_list
             ]
+            # After semantic compression, do not re-enter long-prompt multi-window
+            # logic.  Semantic mode defines a smaller *meaningful token budget*
+            # (for example 256); the native 512-position contract should be padded,
+            # not repopulated with additional windows.
+            enable_long_prompt = False
 
         if enable_artist_mixer and mixer_syntax:
             base_for_artist = prompt_list[0] if prompt_list else ""
