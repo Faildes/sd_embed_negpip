@@ -4139,6 +4139,19 @@ def _anima_artist_mixer_make_encoder(
 ):
     """Artist encoder used by the mixer, sharing this file's Anima v3 path."""
     def _encode_artist(_pipe, text: str) -> torch.Tensor:
+        plan_encoder = getattr(pipe, "encode_prompt_plan", None)
+        if callable(plan_encoder):
+            plan = _anima_build_prompt_plan(
+                text or "",
+                enable_AND=True,
+                qwen_weight_strength=qwen_weight_strength,
+                adapter_weight_strength=adapter_weight_strength,
+                weight_clamp_min=weight_clamp_min,
+                weight_clamp_max=weight_clamp_max,
+            )
+            empty = {"text": " ", "spans": []}
+            pos, _neg = plan_encoder(plan, empty)
+            return pos
         return _anima_v3_encode_single(
             pipe,
             text or "",
@@ -4238,6 +4251,142 @@ def _install_anima_artist_mixer_for_encoder(
     return mixer
 
 
+def _anima_prompt_plan_scalar_factor(
+    raw_weight: float,
+    *,
+    strength: float,
+    clamp_min: Optional[float],
+    clamp_max: Optional[float],
+) -> float:
+    value = torch.tensor([float(raw_weight)], dtype=torch.float32)
+    factor = _anima_v3_scale_weight_tensor(
+        value,
+        strength=float(strength),
+        clamp_min=clamp_min,
+        clamp_max=clamp_max,
+    )
+    return float(factor.item())
+
+
+def _anima_build_prompt_plan(
+    text: str,
+    *,
+    enable_AND: bool,
+    qwen_weight_strength: float,
+    adapter_weight_strength: float,
+    weight_clamp_min: Optional[float],
+    weight_clamp_max: Optional[float],
+) -> Dict[str, Any]:
+    """Convert sd_embed syntax into one full-text prompt memory plus span factors.
+
+    AND and BREAK remain group boundaries; they no longer request separate,
+    completed Anima conditioning tensors.  The visible semantic text is kept in
+    one source sequence so a bridge-aware diffusers-anima pipeline can encode it
+    once and let the original LLM adapter attend over the full Qwen memory.
+    """
+    raw = str(text or "")
+    top_parts = _split_top_level_AND(raw) if enable_AND and _has_top_level_AND(raw) else [raw]
+    clean_parts: List[str] = []
+    spans: List[Dict[str, Any]] = []
+    cursor = 0
+    group_id = 0
+
+    for part_index, part in enumerate(top_parts):
+        segment_text, and_weight = _split_suffix_weight_top_level(part) if len(top_parts) > 1 else (part, 1.0)
+        parsed = parse_prompt_attention(segment_text or "")
+        for piece, piece_weight in parsed:
+            piece = str(piece or "")
+            if not piece:
+                continue
+            if piece.strip().upper() == "BREAK" or float(piece_weight) < 0.0:
+                if clean_parts and not clean_parts[-1].endswith("\n"):
+                    clean_parts.append("\n")
+                    cursor += 1
+                group_id += 1
+                continue
+            start = cursor
+            clean_parts.append(piece)
+            cursor += len(piece)
+            end = cursor
+            effective_weight = float(piece_weight) * float(and_weight)
+            spans.append({
+                "start": start,
+                "end": end,
+                "qwen_factor": _anima_prompt_plan_scalar_factor(
+                    effective_weight,
+                    strength=qwen_weight_strength,
+                    clamp_min=weight_clamp_min,
+                    clamp_max=weight_clamp_max,
+                ),
+                "t5_factor": _anima_prompt_plan_scalar_factor(
+                    effective_weight,
+                    strength=adapter_weight_strength,
+                    clamp_min=weight_clamp_min,
+                    clamp_max=weight_clamp_max,
+                ),
+                "group": group_id,
+            })
+        if part_index < len(top_parts) - 1:
+            separator = " ; "
+            clean_parts.append(separator)
+            cursor += len(separator)
+            group_id += 1
+
+    # Keep whitespace exactly as reconstructed so character-span offsets stay
+    # valid. Tokenizers ignore/handle it naturally; no semantic text is dropped.
+    clean_text = "".join(clean_parts)
+    if not clean_text:
+        clean_text = " "
+    return {
+        "text": clean_text,
+        "spans": spans,
+        "metadata": {
+            "source": "sd_embed",
+            "group_count": group_id + 1,
+            "and_folded_into_spans": bool(len(top_parts) > 1),
+        },
+    }
+
+
+def _anima_encode_prompt_plans_if_supported(
+    pipe,
+    prompt_list: List[str],
+    neg_list: List[str],
+    *,
+    enable_AND: bool,
+    qwen_weight_strength: float,
+    adapter_weight_strength: float,
+    weight_clamp_min: Optional[float],
+    weight_clamp_max: Optional[float],
+) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    encoder = getattr(pipe, "encode_prompt_plan", None)
+    if not callable(encoder):
+        return None
+    pos_plans = [
+        _anima_build_prompt_plan(
+            item or "",
+            enable_AND=enable_AND,
+            qwen_weight_strength=qwen_weight_strength,
+            adapter_weight_strength=adapter_weight_strength,
+            weight_clamp_min=weight_clamp_min,
+            weight_clamp_max=weight_clamp_max,
+        )
+        for item in prompt_list
+    ]
+    neg_plans = [
+        _anima_build_prompt_plan(
+            item or "",
+            enable_AND=enable_AND,
+            qwen_weight_strength=qwen_weight_strength,
+            adapter_weight_strength=adapter_weight_strength,
+            weight_clamp_min=weight_clamp_min,
+            weight_clamp_max=weight_clamp_max,
+        )
+        for item in neg_list
+    ]
+    return encoder(pos_plans, neg_plans)
+
+
 @torch.no_grad()
 def get_weighted_text_embeddings_anima(
     pipe,
@@ -4254,7 +4403,10 @@ def get_weighted_text_embeddings_anima(
     enable_AND: bool = True,
     and_strength: float = 0.60,
     base_bias: float = 4.0,
-    # Long prompt options
+    # New single-memory path. When the matching diffusers-anima patch is present,
+    # this bypasses chunk/AND condition mixing and keeps the full Qwen source.
+    use_prompt_plan: bool = True,
+    # Long prompt options (legacy fallback only)
     enable_long_prompt: bool = True,
     long_prompt_strategy: str = _ANIMA_LONG_PROMPT_FUSION_CHUNK_CONCAT,
     long_prompt_chunk_size: Optional[int] = None,
@@ -4330,6 +4482,28 @@ def get_weighted_text_embeddings_anima(
                 end_block=artist_mixer_end_block,
                 autoclean_previous=artist_mixer_autoclean_previous,
             )
+
+        if use_prompt_plan:
+            planned = _anima_encode_prompt_plans_if_supported(
+                pipe,
+                prompt_list,
+                neg_list,
+                enable_AND=enable_AND,
+                qwen_weight_strength=qwen_weight_strength,
+                adapter_weight_strength=adapter_weight_strength,
+                weight_clamp_min=weight_clamp_min,
+                weight_clamp_max=weight_clamp_max,
+            )
+            if planned is None:
+                raise RuntimeError(
+                    "use_prompt_plan=True requires the matching diffusers-anima bridge/prompt-plan patch. "
+                    "Apply that patch, or explicitly set use_prompt_plan=False to use the legacy chunk/mix path."
+                )
+            pos, neg = planned
+            pos, neg = _anima_v3_align_pos_neg_conditions(pos, neg)
+            if return_artist_mixer:
+                return pos, neg, mixer_obj
+            return pos, neg
 
         if enable_AND and (any(_has_top_level_AND(p or "") for p in prompt_list) or any(_has_top_level_AND(n or "") for n in neg_list)):
             pos_list = [

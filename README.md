@@ -546,3 +546,15 @@ If you use `sd_embed` in your research, please cite the following work:
   year         = {2024},
 }
 ```
+
+## Anima single-memory prompt-plan path
+
+When used with a compatible `diffusers-anima` pipeline exposing
+`encode_prompt_plan`, `get_weighted_text_embeddings_anima()` defaults to
+`use_prompt_plan=True`.  In this path sd_embed parses weights, `AND`, and `BREAK`
+into character-span/group metadata and sends one full prompt memory to
+`diffusers-anima`.  It does **not** build separate completed conditions for each
+long-prompt chunk or `AND` branch before mixing them.
+
+The legacy Anima chunk/mix path remains available for compatibility by passing
+`use_prompt_plan=False`.
