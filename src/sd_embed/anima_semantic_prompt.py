@@ -161,6 +161,7 @@ class SemanticPromptResult:
     compiled: str
     mode: str
     qwen_input_tokens: int
+    anima_qwen_tokens: int
     anima_t5_tokens: int
     used_generation: bool
 
@@ -388,46 +389,74 @@ class AnimaSemanticPromptFrontend:
         )
         return (decoded or text), bool(decoded), input_len
 
-    def _fit_t5_budget(self, text: str) -> str:
+    def _fits_final_budget(self, text: str) -> bool:
+        # The final prompt must fit the same textual content through both tokenizers.
+        # Use the existing T5 budget as the joint semantic budget; the hard model
+        # contract remains 512 and the default 480 leaves safety headroom.
+        budget = min(512, int(self.target_t5_tokens))
+        return (
+            self._token_count(self.qwen_tokenizer, text) <= budget
+            and self._token_count(self.t5_tokenizer, text) <= budget
+        )
+
+    def _fit_final_budget(self, text: str) -> str:
         text = str(text or "").strip()
-        if self._token_count(self.t5_tokenizer, text) <= self.target_t5_tokens:
+        if self._fits_final_budget(text):
             return text
 
-        # Compiler output is phrase-oriented. Keep complete clauses in order so a
-        # late hard token slice is only a last-resort guard rather than the normal path.
+        # Keep complete clauses in prompt-priority order. Do not skip an
+        # overflowing middle clause and then append later tags; doing so changes
+        # the semantic mixture seen by Qwen/T5 and can create competing layouts.
         segments = _dedupe_preserve_order(_TAG_SPLIT_RE.split(text))
         kept: list[str] = []
         for segment in segments:
-            candidate = ", ".join([*kept, segment])
-            if self._token_count(self.t5_tokenizer, candidate) > self.target_t5_tokens:
+            candidate = ", ".join([*kept, segment]).strip()
+            if self._fits_final_budget(candidate):
+                kept.append(segment)
                 continue
-            kept.append(segment)
+            break
         compact = ", ".join(kept).strip()
-        if compact and self._token_count(self.t5_tokenizer, compact) <= self.target_t5_tokens:
+        if compact:
             return compact
 
-        # Defensive fallback for a single overlong natural-language clause.
-        encoded = self.t5_tokenizer(
-            text,
-            add_special_tokens=False,
-            truncation=True,
-            max_length=self.target_t5_tokens,
-        )
-        ids = encoded["input_ids"] if isinstance(encoded, dict) else encoded.input_ids
-        if ids and isinstance(ids[0], list):
-            ids = ids[0]
-        return self.t5_tokenizer.decode(ids, skip_special_tokens=True).strip()
+        # Defensive single-clause fallback: choose one shared textual prefix by
+        # binary search so Qwen and T5 never receive independently truncated tails.
+        words = text.split()
+        pieces = words if len(words) > 1 else list(text)
+        lo, hi = 0, len(pieces)
+        best = ""
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            candidate = (
+                " ".join(pieces[:mid]).strip()
+                if len(words) > 1
+                else "".join(pieces[:mid]).strip()
+            )
+            if not candidate:
+                lo = mid + 1
+                continue
+            if self._fits_final_budget(candidate):
+                best = candidate
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        return best or text[:1]
+
+    # Backward-compatible private alias used by older integrations/tests.
+    def _fit_t5_budget(self, text: str) -> str:
+        return self._fit_final_budget(text)
 
     def process_one(self, text: str, *, negative: bool = False) -> SemanticPromptResult:
         original = str(text or "")
         if negative and not self.process_negative_prompt:
-            final = self._fit_t5_budget(original)
+            final = self._fit_final_budget(original)
             return SemanticPromptResult(
                 original=original,
                 resolved=original,
                 compiled=final,
                 mode=PROMPT_MODE_DIRECT,
                 qwen_input_tokens=self._token_count(self.qwen_tokenizer, original),
+                anima_qwen_tokens=self._token_count(self.qwen_tokenizer, final),
                 anima_t5_tokens=self._token_count(self.t5_tokenizer, final),
                 used_generation=False,
             )
@@ -438,18 +467,18 @@ class AnimaSemanticPromptFrontend:
         used_generation = False
         compiled = resolved
         if mode in {PROMPT_MODE_COMPILE, PROMPT_MODE_HYBRID} or (
-            mode == PROMPT_MODE_DIRECT
-            and self._token_count(self.t5_tokenizer, resolved) > self.target_t5_tokens
+            mode == PROMPT_MODE_DIRECT and not self._fits_final_budget(resolved)
         ):
             compiled, used_generation, qwen_input_tokens = self._generate_compile(resolved, mode)
 
-        compiled = self._fit_t5_budget(compiled)
+        compiled = self._fit_final_budget(compiled)
         return SemanticPromptResult(
             original=original,
             resolved=resolved,
             compiled=compiled,
             mode=mode,
             qwen_input_tokens=qwen_input_tokens,
+            anima_qwen_tokens=self._token_count(self.qwen_tokenizer, compiled),
             anima_t5_tokens=self._token_count(self.t5_tokenizer, compiled),
             used_generation=used_generation,
         )

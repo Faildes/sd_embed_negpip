@@ -39,3 +39,12 @@ def test_raw_concat_keeps_legacy_unbounded_behavior():
         [a, b], strength=1.0, chunk_decay=1.0, mode="raw_concat", anchor_tokens=0
     )
     assert out.shape[1] == _ANIMA_CONDITIONING_MAX_LENGTH * 2
+
+
+def test_safe_chunk_concat_does_not_mix_later_layout_windows():
+    base = torch.randn(1, _ANIMA_CONDITIONING_MAX_LENGTH, 8)
+    other = torch.randn(1, _ANIMA_CONDITIONING_MAX_LENGTH, 8) * 10.0 + 20.0
+    out = _anima_v3_fuse_long_prompt_conditions(
+        [base, other], strength=1.0, chunk_decay=1.0, mode="chunk_concat", anchor_tokens=0
+    )
+    assert torch.equal(out, base)

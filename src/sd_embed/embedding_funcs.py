@@ -2879,6 +2879,7 @@ _ANIMA_CONDITIONING_MAX_LENGTH = 512
 # windows by concatenating native per-window conditions along the sequence
 # dimension instead of compressing them back into a single 512-token tensor.
 # Older fusion modes are still kept as fallbacks/comparison strategies.
+_ANIMA_LONG_PROMPT_FUSION_STRICT_512 = "strict_512"
 _ANIMA_LONG_PROMPT_FUSION_CHUNK_CONCAT = "chunk_concat"
 # Explicit opt-in for the historical behavior that concatenated multiple native
 # 512-token Anima windows into 1024/1536/... conditioning tensors.  Anima is
@@ -3240,9 +3241,18 @@ def _anima_v3_prepare_condition_inputs(
     t5_trunc = int(max_sequence_length) if max_sequence_length and max_sequence_length > 0 else None
 
     for text in prompts:
+        strict_budget = _ANIMA_CONDITIONING_MAX_LENGTH
+        if max_sequence_length is not None and int(max_sequence_length) > 0:
+            strict_budget = min(strict_budget, int(max_sequence_length))
+        fitted_text = _anima_v3_fit_prompt_text_dual_budget(
+            qwen_tokenizer,
+            t5_tokenizer,
+            text or "",
+            chunk_size=strict_budget,
+        )
         q_ids, q_weights, _clean_q, _has_q = _anima_v3_tokenize_with_weights(
             qwen_tokenizer,
-            text or "",
+            fitted_text,
             empty_token_id=int(qwen_pad),
             add_eos=False,
             eos_token_id=None,
@@ -3250,7 +3260,7 @@ def _anima_v3_prepare_condition_inputs(
         )
         t_ids, t_weights, _clean_t, _has_t = _anima_v3_tokenize_with_weights(
             t5_tokenizer,
-            text or "",
+            fitted_text,
             empty_token_id=int(t5_eos),
             add_eos=True,
             eos_token_id=int(t5_eos),
@@ -3695,7 +3705,7 @@ def _anima_v3_fuse_long_prompt_conditions(
     *,
     strength: float,
     chunk_decay: float,
-    mode: str = _ANIMA_LONG_PROMPT_FUSION_CHUNK_CONCAT,
+    mode: str = _ANIMA_LONG_PROMPT_FUSION_STRICT_512,
     anchor_tokens: int = 160,
 ) -> torch.Tensor:
     if not conditions:
@@ -3704,7 +3714,7 @@ def _anima_v3_fuse_long_prompt_conditions(
         return conditions[0]
 
     base = conditions[0]
-    mode = str(mode or _ANIMA_LONG_PROMPT_FUSION_CHUNK_CONCAT).lower()
+    mode = str(mode or _ANIMA_LONG_PROMPT_FUSION_STRICT_512).lower()
     s = float(strength)
     if not math.isfinite(s):
         s = 1.0
@@ -3721,33 +3731,19 @@ def _anima_v3_fuse_long_prompt_conditions(
     if mode in (_ANIMA_LONG_PROMPT_FUSION_RAW_CONCAT, "unsafe_concat", "legacy_concat"):
         return torch.cat([c.to(device=base.device, dtype=base.dtype) for c in conditions], dim=1)
 
-    # ``chunk_concat`` remains the public/backward-compatible mode name, but is
-    # now *bounded*: later windows are injected as a low-gain residual into the
-    # first native 512-token window.  Per-channel statistics are matched to the
-    # first window before fusion, which keeps the model close to its native
-    # style/conditioning distribution while retaining useful tail information.
-    if mode in (_ANIMA_LONG_PROMPT_FUSION_CHUNK_CONCAT, "clip_concat", "seq_concat", "stable"):
-        conditions = _anima_v3_pad_condition_list(conditions, _ANIMA_CONDITIONING_MAX_LENGTH)
-        base = conditions[0]
-        rest = [
-            _anima_v3_match_condition_stats(c.to(device=base.device, dtype=base.dtype), base)
-            for c in conditions[1:]
-        ]
-        if not rest:
-            return base
-        weights = torch.tensor(
-            [decay ** i for i in range(len(rest))],
-            dtype=torch.float32,
-            device=base.device,
-        )
-        weights = weights / weights.sum().clamp_min(1e-6)
-        stacked = torch.stack(rest, dim=0)
-        tail = (stacked * weights.view(-1, 1, 1, 1).to(dtype=stacked.dtype)).sum(dim=0)
-        # 0.25 is deliberately conservative: long-prompt tail context should
-        # refine a native Anima condition, not replace it.
-        blend = max(0.0, min(0.5, 0.25 * s))
-        fused = base + (tail - base) * blend
-        return _anima_v3_match_condition_stats(fused, base)
+    # Strict Anima mode: never merge independent 512-token windows into one
+    # conditioning tensor.  Even bounded averaging/residual fusion can encode
+    # two competing layouts and appear as ghosted/overlapped images.  The text
+    # encoder path should fit one shared Qwen/T5 text prefix before this point;
+    # this branch is a final guard and keeps only that first native window.
+    if mode in (
+        _ANIMA_LONG_PROMPT_FUSION_STRICT_512,
+        _ANIMA_LONG_PROMPT_FUSION_CHUNK_CONCAT,
+        "clip_concat",
+        "seq_concat",
+        "stable",
+    ):
+        return _anima_v3_pad_condition_to_length(base, _ANIMA_CONDITIONING_MAX_LENGTH)
 
     # Legacy bounded fusion modes kept for comparison/backward compatibility.
     if mode == _ANIMA_LONG_PROMPT_FUSION_CHUNK_BLEND:
@@ -3963,7 +3959,7 @@ def _anima_v3_encode_batch(
     weight_clamp_min: Optional[float],
     weight_clamp_max: Optional[float],
     enable_long_prompt: bool = True,
-    long_prompt_strategy: str = _ANIMA_LONG_PROMPT_FUSION_CHUNK_CONCAT,
+    long_prompt_strategy: str = _ANIMA_LONG_PROMPT_FUSION_STRICT_512,
     long_prompt_chunk_size: Optional[int] = None,
     long_prompt_chunk_decay: float = 1.0,
     long_prompt_strength: float = 1.0,
@@ -4021,7 +4017,7 @@ def _anima_v3_encode_single(
     weight_clamp_min: Optional[float],
     weight_clamp_max: Optional[float],
     enable_long_prompt: bool = True,
-    long_prompt_strategy: str = _ANIMA_LONG_PROMPT_FUSION_CHUNK_CONCAT,
+    long_prompt_strategy: str = _ANIMA_LONG_PROMPT_FUSION_STRICT_512,
     long_prompt_chunk_size: Optional[int] = None,
     long_prompt_chunk_decay: float = 1.0,
     long_prompt_strength: float = 1.0,
@@ -4057,7 +4053,7 @@ def _anima_v3_mix_AND(
     and_strength: float,
     base_bias: float,
     enable_long_prompt: bool = True,
-    long_prompt_strategy: str = _ANIMA_LONG_PROMPT_FUSION_CHUNK_CONCAT,
+    long_prompt_strategy: str = _ANIMA_LONG_PROMPT_FUSION_STRICT_512,
     long_prompt_chunk_size: Optional[int] = None,
     long_prompt_chunk_decay: float = 1.0,
     long_prompt_strength: float = 1.0,
@@ -4199,7 +4195,7 @@ def get_weighted_text_embeddings_anima(
     semantic_allow_generation: bool = False,
     semantic_generation_kwargs: Optional[Dict[str, Any]] = None,
     enable_long_prompt: bool = True,
-    long_prompt_strategy: str = _ANIMA_LONG_PROMPT_FUSION_CHUNK_CONCAT,
+    long_prompt_strategy: str = _ANIMA_LONG_PROMPT_FUSION_STRICT_512,
     long_prompt_chunk_size: Optional[int] = None,
     long_prompt_chunk_decay: float = 1.0,
     long_prompt_strength: float = 1.0,
@@ -4452,7 +4448,7 @@ def _anima_artist_mixer_make_encoder(
     weight_clamp_min: Optional[float],
     weight_clamp_max: Optional[float],
     enable_long_prompt: bool = True,
-    long_prompt_strategy: str = _ANIMA_LONG_PROMPT_FUSION_CHUNK_CONCAT,
+    long_prompt_strategy: str = _ANIMA_LONG_PROMPT_FUSION_STRICT_512,
     long_prompt_chunk_size: Optional[int] = None,
     long_prompt_chunk_decay: float = 1.0,
     long_prompt_strength: float = 1.0,
@@ -4507,7 +4503,7 @@ def _install_anima_artist_mixer_for_encoder(
     weight_clamp_min: Optional[float],
     weight_clamp_max: Optional[float],
     enable_long_prompt: bool = True,
-    long_prompt_strategy: str = _ANIMA_LONG_PROMPT_FUSION_CHUNK_CONCAT,
+    long_prompt_strategy: str = _ANIMA_LONG_PROMPT_FUSION_STRICT_512,
     long_prompt_chunk_size: Optional[int] = None,
     long_prompt_chunk_decay: float = 1.0,
     long_prompt_strength: float = 1.0,
@@ -4590,7 +4586,7 @@ def get_weighted_text_embeddings_anima(
     semantic_generation_kwargs: Optional[Dict[str, Any]] = None,
     # Long prompt options
     enable_long_prompt: bool = True,
-    long_prompt_strategy: str = _ANIMA_LONG_PROMPT_FUSION_CHUNK_CONCAT,
+    long_prompt_strategy: str = _ANIMA_LONG_PROMPT_FUSION_STRICT_512,
     long_prompt_chunk_size: Optional[int] = None,
     long_prompt_chunk_decay: float = 1.0,
     long_prompt_strength: float = 1.0,
@@ -4611,8 +4607,9 @@ def get_weighted_text_embeddings_anima(
     """Return Anima positive/negative conditioning with optional Artist Mixer.
 
     Stable defaults deliberately attenuate LPW strength (Qwen=0.60, adapter=0.80)
-    and keep ``chunk_concat`` inside Anima's native 512-position contract. Use
-    ``long_prompt_strategy="raw_concat"`` only for legacy experiments.
+    and fit one shared Qwen/T5 prompt into Anima's native 512-position contract.
+    ``chunk_concat`` is retained as a safe alias of ``strict_512``; multi-window
+    fusion modes are experimental and outputs wider than 512 are rejected.
 
     `enable_semantic=True` integrates the inference-only Qwen Base semantic prompt
     compiler into the weighted Anima path. The semantic stage runs *before* the
@@ -4781,6 +4778,8 @@ def get_weighted_text_embeddings_anima(
             )
 
         pos, neg = _anima_v3_align_pos_neg_conditions(pos, neg)
+        pos = _anima_v3_enforce_native_conditioning_contract(pos, name="positive")
+        neg = _anima_v3_enforce_native_conditioning_contract(neg, name="negative")
         if return_artist_mixer:
             return pos, neg, mixer_obj
         return pos, neg
@@ -4926,6 +4925,107 @@ def _anima_v3_pack_prompt_text_with_breaks(
     return out_chunks or [text or ""]
 
 
+
+def _anima_v3_fit_prompt_text_dual_budget(
+    qwen_tokenizer,
+    t5_tokenizer,
+    text: str,
+    *,
+    chunk_size: int,
+) -> str:
+    """Return one shared prompt string that fits both Qwen and T5 budgets.
+
+    Prompt order is treated as priority order.  BREAK becomes a soft boundary in
+    strict mode instead of spawning a second conditioning window.  This avoids
+    the multi-layout superposition observed when later 512-token chunks are
+    blended back into the first one.
+    """
+    qwen_pad = getattr(qwen_tokenizer, "pad_token_id", None)
+    if qwen_pad is None:
+        qwen_pad = _ANIMA_QWEN3_DEFAULT_PAD_TOKEN_ID
+    t5_eos = getattr(t5_tokenizer, "eos_token_id", None)
+    if t5_eos is None:
+        t5_eos = 1
+
+    budget = max(1, min(int(chunk_size), _ANIMA_CONDITIONING_MAX_LENGTH))
+    t5_content_budget = max(1, budget - 1)
+
+    def fits(candidate: str) -> bool:
+        q_ids, _qw, _qc, _qh = _anima_v3_tokenize_with_weights(
+            qwen_tokenizer,
+            candidate or "",
+            empty_token_id=int(qwen_pad),
+            add_eos=False,
+            eos_token_id=None,
+            truncate_to=None,
+        )
+        # Count T5 content without EOS; reserve one target position for EOS.
+        t_ids, _tw, _tc, _th = _anima_v3_tokenize_with_weights(
+            t5_tokenizer,
+            candidate or "",
+            empty_token_id=int(t5_eos),
+            add_eos=False,
+            eos_token_id=None,
+            truncate_to=None,
+        )
+        return len(q_ids) <= budget and len(t_ids) <= t5_content_budget
+
+    value = str(text or "").strip()
+    if not value or fits(value):
+        return value
+
+    items = _anima_v3_split_top_level_comma_items(value)
+    kept: List[str] = []
+    for item in items:
+        item = (item or "").strip()
+        if not item or item.upper() == "BREAK":
+            continue
+        candidate = ", ".join([*kept, item]).strip()
+        if fits(candidate):
+            kept.append(item)
+            continue
+        # Preserve prompt priority. Do not skip a conflicting/oversized middle
+        # item and then append later tags, which can create a different layout.
+        break
+    compact = ", ".join(kept).strip()
+    if compact:
+        return compact
+
+    # Single overlong item fallback. Prefer a whole-word prefix, then characters.
+    words = value.split()
+    pieces = words if len(words) > 1 else list(value)
+    lo, hi = 0, len(pieces)
+    best = ""
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        candidate = (
+            " ".join(pieces[:mid]).strip()
+            if len(words) > 1
+            else "".join(pieces[:mid]).strip()
+        )
+        if not candidate:
+            lo = mid + 1
+            continue
+        if fits(candidate):
+            best = candidate
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return best or value[:1]
+
+
+def _anima_v3_enforce_native_conditioning_contract(cond: torch.Tensor, *, name: str) -> torch.Tensor:
+    if cond.dim() != 3:
+        raise ValueError(f"{name} Anima conditioning must be rank-3 (batch, sequence, hidden).")
+    seq_len = int(cond.shape[1])
+    if seq_len > _ANIMA_CONDITIONING_MAX_LENGTH:
+        raise ValueError(
+            f"{name} Anima conditioning has {seq_len} positions, exceeding the native 512-position contract. "
+            "Use long_prompt_strategy='strict_512' (or the safe chunk_concat alias) instead of multi-window fusion."
+        )
+    return _anima_v3_pad_condition_to_length(cond, _ANIMA_CONDITIONING_MAX_LENGTH)
+
+
 @torch.no_grad()
 def _anima_v3_encode_long_single(
     pipe,
@@ -4984,6 +5084,38 @@ def _anima_v3_encode_long_single(
             qwen_hidden=qwen_hidden,
             t5_ids=t5_ids,
             t5_weights=t5_weights,
+        )
+
+    strict_mode = str(long_prompt_strategy or _ANIMA_LONG_PROMPT_FUSION_STRICT_512).lower() in (
+        _ANIMA_LONG_PROMPT_FUSION_STRICT_512,
+        _ANIMA_LONG_PROMPT_FUSION_CHUNK_CONCAT,
+        "clip_concat",
+        "seq_concat",
+        "stable",
+        _ANIMA_LONG_PROMPT_FUSION_TRUNCATE,
+    )
+    if strict_mode:
+        fitted_text = _anima_v3_fit_prompt_text_dual_budget(
+            qwen_tokenizer,
+            t5_tokenizer,
+            text or "",
+            chunk_size=chunk_size,
+        )
+        qwen_hidden, t5_ids, t5_weights = _anima_v3_prepare_condition_inputs(
+            pipe,
+            [fitted_text],
+            max_sequence_length=chunk_size,
+            qwen_weight_strength=qwen_weight_strength,
+            t5_weight_strength=adapter_weight_strength,
+            weight_clamp_min=weight_clamp_min,
+            weight_clamp_max=weight_clamp_max,
+        )
+        return _anima_v3_build_condition(
+            pipe,
+            qwen_hidden=qwen_hidden,
+            t5_ids=t5_ids,
+            t5_weights=t5_weights,
+            target_length=_ANIMA_CONDITIONING_MAX_LENGTH,
         )
 
     text_chunks = _anima_v3_pack_prompt_text_with_breaks(

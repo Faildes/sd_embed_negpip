@@ -96,3 +96,30 @@ def test_base_semantic_generation_is_opt_in_even_when_over_budget():
     result = frontend.process_one(", ".join(f"tag_{i}" for i in range(100)))
     assert result.used_generation is False
     assert result.anima_t5_tokens <= 32
+
+
+def test_semantic_budget_is_joint_qwen_and_t5_not_t5_only():
+    class DenseQwenTokenizer(TinyTokenizer):
+        def __call__(self, text, **kwargs):
+            base = super().__call__(text, **kwargs)
+            ids = base["input_ids"]
+            if kwargs.get("return_tensors") == "pt":
+                import torch
+                expanded = ids.repeat_interleave(2, dim=-1)
+                return {"input_ids": expanded, "attention_mask": torch.ones_like(expanded)}
+            return {"input_ids": [x for token in ids for x in (token, token + 1000)]}
+
+    class MixedPipe(DummyPipe):
+        def __init__(self):
+            self.prompt_tokenizer = SimpleNamespace(
+                qwen_tokenizer=DenseQwenTokenizer(),
+                t5_tokenizer=TinyTokenizer(),
+            )
+            self.text_encoder = object()
+            self.processor = None
+
+    pipe = MixedPipe()
+    frontend = AnimaSemanticPromptFrontend(pipe, mode=PROMPT_MODE_DIRECT, target_t5_tokens=32)
+    result = frontend.process_one(", ".join(f"tag_{i}" for i in range(100)))
+    assert result.anima_qwen_tokens <= 32
+    assert result.anima_t5_tokens <= 32
