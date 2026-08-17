@@ -21,3 +21,10 @@ def test_prompt_plan_v2_metadata_is_present():
     source = Path("src/sd_embed/embedding_funcs.py").read_text(encoding="utf-8")
     assert '"prompt_plan_version": 2' in source
     assert '"conditioning_mode": "single_qwen_memory"' in source
+
+
+def test_final_encoder_v3_is_accepted_by_alignment_guard():
+    source = Path("src/sd_embed/embedding_funcs.py").read_text(encoding="utf-8")
+    assert "conditioner_attached" in source
+    assert "anima_ready" in source
+    assert "v3 final encoder" in source

@@ -4276,6 +4276,7 @@ def _anima_build_prompt_plan(
     adapter_weight_strength: float,
     weight_clamp_min: Optional[float],
     weight_clamp_max: Optional[float],
+    semicolon_groups: bool = True,
 ) -> Dict[str, Any]:
     """Convert sd_embed syntax into one full-text prompt memory plus span factors.
 
@@ -4304,28 +4305,42 @@ def _anima_build_prompt_plan(
                     cursor += 1
                 group_id += 1
                 continue
-            start = cursor
-            clean_parts.append(piece)
-            cursor += len(piece)
-            end = cursor
-            effective_weight = float(piece_weight) * float(and_weight)
-            spans.append({
-                "start": start,
-                "end": end,
-                "qwen_factor": _anima_prompt_plan_scalar_factor(
-                    effective_weight,
-                    strength=qwen_weight_strength,
-                    clamp_min=weight_clamp_min,
-                    clamp_max=weight_clamp_max,
-                ),
-                "t5_factor": _anima_prompt_plan_scalar_factor(
-                    effective_weight,
-                    strength=adapter_weight_strength,
-                    clamp_min=weight_clamp_min,
-                    clamp_max=weight_clamp_max,
-                ),
-                "group": group_id,
-            })
+
+            # v4 treats top-level semicolons as *soft* binding boundaries. The
+            # visible text and one-memory architecture are preserved; only
+            # PromptPlan group ids change so the final encoder does not average
+            # semantic expansion slots across different character clauses.
+            subpieces = piece.split(";") if semicolon_groups else [piece]
+            for sub_index, subpiece in enumerate(subpieces):
+                if sub_index > 0:
+                    separator = " ; "
+                    clean_parts.append(separator)
+                    cursor += len(separator)
+                    group_id += 1
+                if not subpiece:
+                    continue
+                start = cursor
+                clean_parts.append(subpiece)
+                cursor += len(subpiece)
+                end = cursor
+                effective_weight = float(piece_weight) * float(and_weight)
+                spans.append({
+                    "start": start,
+                    "end": end,
+                    "qwen_factor": _anima_prompt_plan_scalar_factor(
+                        effective_weight,
+                        strength=qwen_weight_strength,
+                        clamp_min=weight_clamp_min,
+                        clamp_max=weight_clamp_max,
+                    ),
+                    "t5_factor": _anima_prompt_plan_scalar_factor(
+                        effective_weight,
+                        strength=adapter_weight_strength,
+                        clamp_min=weight_clamp_min,
+                        clamp_max=weight_clamp_max,
+                    ),
+                    "group": group_id,
+                })
         if part_index < len(top_parts) - 1:
             separator = " ; "
             clean_parts.append(separator)
@@ -4347,6 +4362,7 @@ def _anima_build_prompt_plan(
             "preserve_full_text": True,
             "group_count": group_id + 1,
             "and_folded_into_spans": bool(len(top_parts) > 1),
+            "semicolon_groups": bool(semicolon_groups),
         },
     }
 
@@ -4361,6 +4377,7 @@ def _anima_encode_prompt_plans_if_supported(
     adapter_weight_strength: float,
     weight_clamp_min: Optional[float],
     weight_clamp_max: Optional[float],
+    semicolon_groups: bool = True,
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
     encoder = getattr(pipe, "encode_prompt_plan", None)
     if not callable(encoder):
@@ -4373,6 +4390,7 @@ def _anima_encode_prompt_plans_if_supported(
             adapter_weight_strength=adapter_weight_strength,
             weight_clamp_min=weight_clamp_min,
             weight_clamp_max=weight_clamp_max,
+            semicolon_groups=semicolon_groups,
         )
         for item in prompt_list
     ]
@@ -4384,6 +4402,7 @@ def _anima_encode_prompt_plans_if_supported(
             adapter_weight_strength=adapter_weight_strength,
             weight_clamp_min=weight_clamp_min,
             weight_clamp_max=weight_clamp_max,
+            semicolon_groups=semicolon_groups,
         )
         for item in neg_list
     ]
@@ -4397,20 +4416,22 @@ def _anima_require_aligned_text_encoder(pipe, *, required: bool) -> None:
     if callable(describe):
         info = describe()
         family = str(info.get("encoder_family", "unknown")).lower()
-        attached = bool(info.get("bridge_attached", False))
-        if family == "qwen3.5" and not attached:
+        ready = bool(info.get("anima_ready", False))
+        attached = bool(info.get("bridge_attached", False) or info.get("conditioner_attached", False))
+        if family == "qwen3.5" and not (ready or attached):
             raise RuntimeError(
-                "Qwen3.5 is active but no Anima encoder-compatibility profile is attached. "
-                "Load a v2 bridge profile with pipe.load_text_encoder_bridge(...), or use a "
-                "self-contained aligned-encoder profile as encoder_path."
+                "Qwen3.5 is active but no Anima-ready text-encoder path is attached. "
+                "Load a v2 bridge/aligned profile, or pass a v3 final encoder directly as encoder_path."
             )
         return
     text_encoder = getattr(pipe, "text_encoder", None)
     family = str(getattr(text_encoder, "_anima_text_encoder_family", "unknown")).lower()
     bridge = getattr(pipe, "text_encoder_bridge", None)
-    if family == "qwen3.5" and bridge is None:
+    conditioner = getattr(pipe, "text_encoder_conditioner", None)
+    ready = bool(getattr(text_encoder, "_anima_conditioning_ready", False))
+    if family == "qwen3.5" and bridge is None and conditioner is None and not ready:
         raise RuntimeError(
-            "Qwen3.5 is active but the pipeline does not expose an attached Anima text-encoder bridge/profile."
+            "Qwen3.5 is active but the pipeline does not expose an Anima-ready bridge, aligned profile, or final encoder head."
         )
 
 
@@ -4436,6 +4457,21 @@ def get_weighted_text_embeddings_anima(
     # Prevent accidental use of raw Qwen3.5 hidden states against the 0.6B-trained
     # Anima adapter. Native Qwen3-0.6B does not require a bridge.
     require_aligned_text_encoder: bool = True,
+    # v4 binding/stability controls. None means use the active final encoder or
+    # bridge metadata defaults. These apply to both v2 and v3 paths.
+    conditioning_center_strength: Optional[float] = None,
+    conditioning_variance_strength: Optional[float] = None,
+    conditioning_rms_strength: Optional[float] = None,
+    conditioning_delta_clip_ratio: Optional[float] = None,
+    conditioning_token_rms_strength: Optional[float] = None,
+    conditioning_token_rms_min_ratio: Optional[float] = None,
+    conditioning_token_rms_max_ratio: Optional[float] = None,
+    semantic_expansion_strength: Optional[float] = None,
+    semantic_expansion_residual_clip: Optional[float] = None,
+    semantic_expansion_group_aware: Optional[bool] = None,
+    semantic_expansion_coherence_power: Optional[float] = None,
+    semantic_expansion_min_coherence: Optional[float] = None,
+    prompt_plan_semicolon_groups: bool = True,
     # Long prompt options (legacy fallback only)
     enable_long_prompt: bool = True,
     long_prompt_strategy: str = _ANIMA_LONG_PROMPT_FUSION_CHUNK_CONCAT,
@@ -4474,6 +4510,31 @@ def get_weighted_text_embeddings_anima(
             neg_prompt,
             num_images_per_prompt=num_images_per_prompt,
         )
+
+        stability_setter = getattr(pipe, "set_text_encoder_conditioning_stability", None)
+        stability_values = (
+            conditioning_center_strength, conditioning_variance_strength, conditioning_rms_strength,
+            conditioning_delta_clip_ratio, conditioning_token_rms_strength,
+            conditioning_token_rms_min_ratio, conditioning_token_rms_max_ratio,
+            semantic_expansion_strength, semantic_expansion_residual_clip,
+            semantic_expansion_group_aware, semantic_expansion_coherence_power,
+            semantic_expansion_min_coherence,
+        )
+        if callable(stability_setter) and any(value is not None for value in stability_values):
+            stability_setter(
+                center_strength=conditioning_center_strength,
+                variance_strength=conditioning_variance_strength,
+                rms_strength=conditioning_rms_strength,
+                delta_clip_ratio=conditioning_delta_clip_ratio,
+                token_rms_strength=conditioning_token_rms_strength,
+                token_rms_min_ratio=conditioning_token_rms_min_ratio,
+                token_rms_max_ratio=conditioning_token_rms_max_ratio,
+                semantic_expansion_strength=semantic_expansion_strength,
+                semantic_expansion_residual_clip=semantic_expansion_residual_clip,
+                semantic_expansion_group_aware=semantic_expansion_group_aware,
+                semantic_expansion_coherence_power=semantic_expansion_coherence_power,
+                semantic_expansion_min_coherence=semantic_expansion_min_coherence,
+            )
 
         mixer_syntax = artist_mixer.strip() if isinstance(artist_mixer, str) and artist_mixer.strip() else None
         if enable_artist_mixer:
@@ -4526,6 +4587,7 @@ def get_weighted_text_embeddings_anima(
                 adapter_weight_strength=adapter_weight_strength,
                 weight_clamp_min=weight_clamp_min,
                 weight_clamp_max=weight_clamp_max,
+                semicolon_groups=bool(prompt_plan_semicolon_groups),
             )
             if planned is None:
                 raise RuntimeError(

@@ -559,9 +559,15 @@ long-prompt chunk or `AND` branch before mixing them.
 The legacy Anima chunk/mix path remains available for compatibility by passing
 `use_prompt_plan=False`.
 
-For Qwen3.5 prompt-plan use, sd_embed now expects the pipeline to expose an
-attached Anima encoder-compatibility profile by default. A v2 self-contained
-aligned encoder also satisfies this requirement automatically. Set
-`require_aligned_text_encoder=False` only for deliberate raw Qwen3.5 A/B tests.
+For Qwen3.5 prompt-plan use, sd_embed expects an Anima-ready text-encoder path by
+default. This can be a v2 bridge/aligned profile or the single-file v3 final
+encoder. The v3 path keeps the aligned token stream as the primary memory and may
+append conservative semantic-expansion slots without changing sd_embed's prompt
+plan format. Set `require_aligned_text_encoder=False` only for deliberate raw
+Qwen3.5 A/B tests.
 Prompt plans are tagged as version 2 single-memory plans and never invoke
 semantic rewriting or text-budget compression.
+
+### Anima final encoder v3 + v4 stability
+
+When used with the matching diffusers-anima v4-over-v3 patch, the final Anima embedding helper can optionally tune the active v2 bridge or v3 final-encoder conditioner through `conditioning_*` keyword arguments. PromptPlan semicolons are soft binding boundaries by default (`prompt_plan_semicolon_groups=True`), which helps keep multi-character semantic expansion slots separate while preserving one Qwen source memory and one adapter pass.
