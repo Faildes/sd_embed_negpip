@@ -4409,29 +4409,46 @@ def _anima_encode_prompt_plans_if_supported(
     return encoder(pos_plans, neg_plans)
 
 
-def _anima_require_aligned_text_encoder(pipe, *, required: bool) -> None:
-    if not required:
+def _anima_require_aligned_text_encoder(
+    pipe,
+    *,
+    required: bool,
+    native_required: bool = False,
+) -> None:
+    if not required and not native_required:
         return
     describe = getattr(pipe, "describe_text_encoder_profile", None)
     if callable(describe):
         info = describe()
         family = str(info.get("encoder_family", "unknown")).lower()
+        native = bool(info.get("native_encoder", False))
         ready = bool(info.get("anima_ready", False))
         attached = bool(info.get("bridge_attached", False) or info.get("conditioner_attached", False))
-        if family == "qwen3.5" and not (ready or attached):
+        if native_required and not native:
+            raise RuntimeError(
+                "This call requires a bridge-free Anima-native text encoder, but the active path is not native. "
+                "Load an anima_native_text_encoder_v1 checkpoint as encoder_path."
+            )
+        if required and family == "qwen3.5" and not (ready or attached or native):
             raise RuntimeError(
                 "Qwen3.5 is active but no Anima-ready text-encoder path is attached. "
-                "Load a v2 bridge/aligned profile, or pass a v3 final encoder directly as encoder_path."
+                "Load a v2 bridge/aligned profile, a v3 final encoder, or preferably an "
+                "anima_native_text_encoder_v1 checkpoint."
             )
         return
     text_encoder = getattr(pipe, "text_encoder", None)
     family = str(getattr(text_encoder, "_anima_text_encoder_family", "unknown")).lower()
     bridge = getattr(pipe, "text_encoder_bridge", None)
     conditioner = getattr(pipe, "text_encoder_conditioner", None)
+    native = bool(getattr(text_encoder, "_anima_native_encoder", False))
     ready = bool(getattr(text_encoder, "_anima_conditioning_ready", False))
-    if family == "qwen3.5" and bridge is None and conditioner is None and not ready:
+    if native_required and not native:
         raise RuntimeError(
-            "Qwen3.5 is active but the pipeline does not expose an Anima-ready bridge, aligned profile, or final encoder head."
+            "This call requires a bridge-free Anima-native text encoder, but the pipeline does not expose one."
+        )
+    if required and family == "qwen3.5" and bridge is None and conditioner is None and not ready and not native:
+        raise RuntimeError(
+            "Qwen3.5 is active but the pipeline does not expose an Anima-ready bridge, conditioner, or native encoder."
         )
 
 
@@ -4457,6 +4474,9 @@ def get_weighted_text_embeddings_anima(
     # Prevent accidental use of raw Qwen3.5 hidden states against the 0.6B-trained
     # Anima adapter. Native Qwen3-0.6B does not require a bridge.
     require_aligned_text_encoder: bool = True,
+    # Final deployment guard. When True, legacy bridge/v3-conditioner paths are
+    # rejected and only anima_native_text_encoder_v1 is accepted.
+    require_native_text_encoder: bool = False,
     # v4 binding/stability controls. None means use the active final encoder or
     # bridge metadata defaults. These apply to both v2 and v3 paths.
     conditioning_center_strength: Optional[float] = None,
@@ -4511,6 +4531,18 @@ def get_weighted_text_embeddings_anima(
             num_images_per_prompt=num_images_per_prompt,
         )
 
+        describe_encoder = getattr(pipe, "describe_text_encoder_profile", None)
+        native_encoder_active = False
+        if callable(describe_encoder):
+            try:
+                native_encoder_active = bool(describe_encoder().get("native_encoder", False))
+            except Exception:
+                native_encoder_active = False
+        if not native_encoder_active:
+            native_encoder_active = bool(
+                getattr(getattr(pipe, "text_encoder", None), "_anima_native_encoder", False)
+            )
+
         stability_setter = getattr(pipe, "set_text_encoder_conditioning_stability", None)
         stability_values = (
             conditioning_center_strength, conditioning_variance_strength, conditioning_rms_strength,
@@ -4520,7 +4552,11 @@ def get_weighted_text_embeddings_anima(
             semantic_expansion_group_aware, semantic_expansion_coherence_power,
             semantic_expansion_min_coherence,
         )
-        if callable(stability_setter) and any(value is not None for value in stability_values):
+        if (
+            not native_encoder_active
+            and callable(stability_setter)
+            and any(value is not None for value in stability_values)
+        ):
             stability_setter(
                 center_strength=conditioning_center_strength,
                 variance_strength=conditioning_variance_strength,
@@ -4574,10 +4610,13 @@ def get_weighted_text_embeddings_anima(
                 autoclean_previous=artist_mixer_autoclean_previous,
             )
 
+        _anima_require_aligned_text_encoder(
+            pipe,
+            required=bool(require_aligned_text_encoder),
+            native_required=bool(require_native_text_encoder),
+        )
+
         if use_prompt_plan:
-            _anima_require_aligned_text_encoder(
-                pipe, required=bool(require_aligned_text_encoder)
-            )
             planned = _anima_encode_prompt_plans_if_supported(
                 pipe,
                 prompt_list,
