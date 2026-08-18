@@ -2027,6 +2027,47 @@ def _anima_get_component(pipe, names: List[str], *, required: bool = False):
     return None
 
 
+def _anima_module_runtime_device(module):
+    if module is None:
+        return None
+    try:
+        value = getattr(module, "device", None)
+        if value is not None:
+            return value
+    except Exception:
+        pass
+    try:
+        return next(module.parameters()).device
+    except (AttributeError, StopIteration, TypeError):
+        pass
+    try:
+        return next(module.buffers()).device
+    except (AttributeError, StopIteration, TypeError):
+        return None
+
+
+def _anima_module_runtime_dtype(module):
+    if module is None:
+        return None
+    try:
+        value = getattr(module, "dtype", None)
+        if isinstance(value, torch.dtype):
+            return value
+    except Exception:
+        pass
+    fallback = None
+    for iterator_name in ("parameters", "buffers"):
+        try:
+            iterator = getattr(module, iterator_name)()
+        except (AttributeError, TypeError):
+            continue
+        for tensor in iterator:
+            fallback = tensor.dtype
+            if tensor.is_floating_point() or tensor.is_complex():
+                return tensor.dtype
+    return fallback
+
+
 def _anima_get_device(pipe):
     for name in ("_execution_device", "execution_device", "_anima_execution_device", "device"):
         try:
@@ -2035,22 +2076,24 @@ def _anima_get_device(pipe):
                 return v
         except Exception:
             pass
+    for obj_name in ("text_encoder", "transformer"):
+        obj = _anima_get_component(pipe, [obj_name], required=False)
+        v = _anima_module_runtime_device(obj)
+        if v is not None:
+            return v
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def _anima_get_dtype(pipe):
     for obj_name in ("text_encoder", "transformer"):
         obj = _anima_get_component(pipe, [obj_name], required=False)
-        try:
-            v = getattr(obj, "dtype")
-            if v is not None:
-                return v
-        except Exception:
-            pass
+        v = _anima_module_runtime_dtype(obj)
+        if v is not None:
+            return v
     for name in ("text_encoder_dtype", "_anima_model_dtype", "model_dtype", "dtype"):
         try:
             v = getattr(pipe, name)
-            if v is not None:
+            if isinstance(v, torch.dtype):
                 return v
         except Exception:
             pass
@@ -4417,38 +4460,45 @@ def _anima_require_aligned_text_encoder(
 ) -> None:
     if not required and not native_required:
         return
-    describe = getattr(pipe, "describe_text_encoder_profile", None)
-    if callable(describe):
-        info = describe()
-        family = str(info.get("encoder_family", "unknown")).lower()
-        native = bool(info.get("native_encoder", False))
-        ready = bool(info.get("anima_ready", False))
-        attached = bool(info.get("bridge_attached", False) or info.get("conditioner_attached", False))
-        if native_required and not native:
-            raise RuntimeError(
-                "This call requires a bridge-free Anima-native text encoder, but the active path is not native. "
-                "Load an anima_native_text_encoder_v1 checkpoint as encoder_path."
-            )
-        if required and family == "qwen3.5" and not (ready or attached or native):
-            raise RuntimeError(
-                "Qwen3.5 is active but no Anima-ready text-encoder path is attached. "
-                "Load a v2 bridge/aligned profile, a v3 final encoder, or preferably an "
-                "anima_native_text_encoder_v1 checkpoint."
-            )
-        return
+
+    # Treat describe_text_encoder_profile() as useful metadata, not as the only
+    # source of truth.  Mixed diffusers-anima/sd_embed revisions can expose an
+    # older profile dictionary while the actual runtime encoder is already an
+    # Anima-native wrapper.
     text_encoder = getattr(pipe, "text_encoder", None)
     family = str(getattr(text_encoder, "_anima_text_encoder_family", "unknown")).lower()
-    bridge = getattr(pipe, "text_encoder_bridge", None)
-    conditioner = getattr(pipe, "text_encoder_conditioner", None)
     native = bool(getattr(text_encoder, "_anima_native_encoder", False))
     ready = bool(getattr(text_encoder, "_anima_conditioning_ready", False))
+    bridge = getattr(pipe, "text_encoder_bridge", None)
+    conditioner = getattr(pipe, "text_encoder_conditioner", None)
+    attached = bridge is not None or conditioner is not None
+
+    describe = getattr(pipe, "describe_text_encoder_profile", None)
+    if callable(describe):
+        try:
+            info = describe()
+        except Exception:
+            info = None
+        if isinstance(info, dict):
+            described_family = str(info.get("encoder_family", "unknown")).lower()
+            if described_family not in {"", "unknown", "none"}:
+                family = described_family
+            native = native or bool(info.get("native_encoder", False))
+            ready = ready or bool(info.get("anima_ready", False))
+            attached = attached or bool(
+                info.get("bridge_attached", False) or info.get("conditioner_attached", False)
+            )
+
     if native_required and not native:
         raise RuntimeError(
-            "This call requires a bridge-free Anima-native text encoder, but the pipeline does not expose one."
+            "This call requires a bridge-free Anima-native text encoder, but the active path is not native. "
+            "Load an anima_native_text_encoder_v1 checkpoint as encoder_path."
         )
-    if required and family == "qwen3.5" and bridge is None and conditioner is None and not ready and not native:
+    if required and family == "qwen3.5" and not (ready or attached or native):
         raise RuntimeError(
-            "Qwen3.5 is active but the pipeline does not expose an Anima-ready bridge, conditioner, or native encoder."
+            "Qwen3.5 is active but no Anima-ready text-encoder path is attached. "
+            "Load a v2 bridge/aligned profile, a v3 final encoder, or preferably an "
+            "anima_native_text_encoder_v1 checkpoint."
         )
 
 
