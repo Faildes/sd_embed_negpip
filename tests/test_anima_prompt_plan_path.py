@@ -15,6 +15,8 @@ def test_final_anima_path_exposes_prompt_plan_switch():
     node = _final_anima_embedding_def()
     args = {arg.arg for arg in node.args.kwonlyargs}
     assert "use_prompt_plan" in args
+    assert "prompt_plan_auto_subject_groups" in args
+    assert "prompt_plan_exact_subject_count" in args
 
 
 def test_prompt_plan_helpers_exist():
@@ -46,3 +48,31 @@ def test_v4_semicolon_grouping_is_threaded_into_prompt_plan_builder():
     assert 'semicolon_groups: bool = True' in source
     assert '"semicolon_groups": bool(semicolon_groups)' in source
     assert 'semicolon_groups=bool(prompt_plan_semicolon_groups)' in source
+
+
+def test_v5_subject_binding_metadata_is_threaded_without_rewriting_prompt():
+    source = Path("src/sd_embed/embedding_funcs.py").read_text(encoding="utf-8")
+    for marker in (
+        '"subject_binding_version": 2',
+        '"subject_group_ids": subject_group_ids',
+        'metadata["subject_count"]',
+        '_ANIMA_COMPACT_GENDER_COUNT_RE',
+        'auto_subject_groups=bool(prompt_plan_auto_subject_groups)',
+        'exact_subject_count=bool(prompt_plan_exact_subject_count)',
+    ):
+        assert marker in source
+    ast.parse(source)
+
+
+def test_v6_prompt_plan_exposes_color_intent_and_calibration_bucket_metadata():
+    source = Path("src/sd_embed/embedding_funcs.py").read_text(encoding="utf-8")
+    for marker in (
+        '"saturation_intent_version": 1',
+        '"color_intent": color_intent',
+        '"explicit_color_intent": color_intent != "neutral"',
+        '"calibration_bucket": calibration_bucket',
+        'def _anima_color_intent',
+        'def _anima_calibration_bucket',
+    ):
+        assert marker in source
+    ast.parse(source)

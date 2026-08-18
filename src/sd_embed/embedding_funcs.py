@@ -30,6 +30,7 @@ from diffusers.utils import (
     unscale_lora_layers,
 )
 import math
+import re
 from diffusers import FluxPipeline
 from typing import Any
 from typing import Dict
@@ -4311,6 +4312,183 @@ def _anima_prompt_plan_scalar_factor(
     return float(factor.item())
 
 
+_ANIMA_EXACT_COUNT_WORDS: Dict[str, int] = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+    "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11,
+    "twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15, "sixteen": 16,
+}
+_ANIMA_COMPACT_GENDER_COUNT_RE = re.compile(
+    r"(?i)(?<!\d)(\d{1,2})\s*(girls?|boys?|women|men)(?!\w)"
+)
+_ANIMA_EXACT_COUNT_PATTERNS = (
+    re.compile(r"(?i)\bexactly\s+(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|\d{1,2})\s+(?:girls?|boys?|women|men|people|persons?|characters?)\b"),
+    re.compile(r"(?i)\b(?:a group of|group of)\s+(one|two|three|four|five|six|seven|eight|nine|ten|\d{1,2})\s+(?:girls?|boys?|women|men|people|persons?|characters?)\b"),
+    re.compile(r"(?<!\d)(\d{1,2})\s*人(?:の人物|物)?"),
+    re.compile(r"(?<!\d)(\d{1,2})\s*(?:个|個)(?:人物|人)"),
+    re.compile(r"(?<!\d)(\d{1,2})\s*명의\s*(?:인물|사람|여성|남성)"),
+)
+_ANIMA_SUBJECT_MARKER_RE = re.compile(
+    r"(?i)^\s*(?:subject|character|char|person|woman|man|girl|boy)\s*(?:#?\d+|[A-H])\s*:"
+)
+_ANIMA_POSITION_MARKER_RE = re.compile(
+    r"(?i)^\s*(?:far\s+left|leftmost|left\b|center[- ]?left|centre[- ]?left|center\b|centre\b|center[- ]?right|centre[- ]?right|rightmost|far\s+right|right\b)"
+)
+_ANIMA_LABEL_MARKER_RE = re.compile(r"^\s*[^,;:\n]{1,48}\s*:\s*\S")
+_ANIMA_CHARACTER_CUES = (
+    "hair", "eyes", "eye", "dress", "uniform", "jacket", "coat", "hoodie", "shirt",
+    "skirt", "pants", "trousers", "sweater", "cardigan", "outfit", "costume", "wearing",
+    "girl", "boy", "woman", "man", "character", "person", "subject",
+)
+_ANIMA_GLOBAL_CUES = (
+    "background", "lighting", "quality", "masterpiece", "camera", "composition", "style",
+    "palette", "render", "illustration", "scenery", "environment",
+)
+_ANIMA_COLOR_INTENT_PATTERNS = (
+    ("high", re.compile(r"(?i)\b(?:high saturation|highly saturated|vivid saturated colors?)\b")),
+    ("controlled", re.compile(r"(?i)\b(?:controlled saturation|balanced saturation)\b")),
+    ("muted", re.compile(r"(?i)\b(?:low saturation|desaturated|muted earth tones|muted palette)\b")),
+    ("monochrome", re.compile(r"(?i)\b(?:monochrome|black and white|grayscale|greyscale)\b")),
+    ("pastel", re.compile(r"(?i)\b(?:pastel palette|pastel colors?)\b")),
+)
+_ANIMA_STYLE_BUCKET_RE = re.compile(
+    r"(?i)\b(?:anime illustration|clean cel shading|soft painterly shading|graphic poster style|"
+    r"visual novel event cg|retro game illustration|y2k futurism|vaporwave|frutiger aero|chromecore|"
+    r"metalheart|pop art|acid graphics|editorial illustration|digital painting|flat color design)\b"
+)
+_ANIMA_COMPOSITION_BUCKET_RE = re.compile(
+    r"(?i)\b(?:from above|from below|low angle|high angle|dutch angle|fisheye|wide-angle|telephoto|"
+    r"close-up|full body|wide shot|panoramic|foreshortening|perspective|composition|foreground|"
+    r"standing|sitting|kneeling|walking|running|jumping|crouching|contrapposto)\b"
+)
+
+def _anima_color_intent(text: str) -> str:
+    raw = str(text or "")
+    for name, pattern in _ANIMA_COLOR_INTENT_PATTERNS:
+        if pattern.search(raw):
+            return name
+    return "neutral"
+
+def _anima_calibration_bucket(text: str, subject_count: Optional[int]) -> str:
+    raw = str(text or "")
+    if (
+        (subject_count is not None and int(subject_count) >= 2)
+        or re.search(r"(?i)\b(?:two women|two men|woman and man|duo|trio|group portrait|anthro couple|anthro trio)\b", raw)
+    ):
+        return "binding"
+    if any(ord(ch) > 127 for ch in raw):
+        return "multilingual"
+    if _anima_color_intent(raw) != "neutral" or re.search(
+        r"(?i)\b(?:warm palette|cool palette|neon lighting|colored bounce light|red and cyan accents)\b", raw
+    ):
+        return "color"
+    if _ANIMA_STYLE_BUCKET_RE.search(raw):
+        return "style"
+    if _ANIMA_COMPOSITION_BUCKET_RE.search(raw):
+        return "composition"
+    return "general"
+
+
+def _anima_extract_exact_subject_count(text: str) -> Optional[int]:
+    raw = str(text or "")
+    # Explicit natural-language/multilingual cardinality wins over tag-style
+    # counts when both are present.
+    for pattern in _ANIMA_EXACT_COUNT_PATTERNS:
+        match = pattern.search(raw)
+        if match is None:
+            continue
+        value = str(match.group(1)).lower()
+        count = int(value) if value.isdigit() else int(_ANIMA_EXACT_COUNT_WORDS.get(value, 0))
+        if 1 <= count <= 16:
+            return count
+    # Danbooru-style mixed groups such as ``2girls, 2boys`` describe four
+    # subjects. Sum distinct gender-category counts instead of stopping at the
+    # first token.
+    compact: Dict[str, int] = {}
+    for match in _ANIMA_COMPACT_GENDER_COUNT_RE.finditer(raw):
+        value = int(match.group(1))
+        category = str(match.group(2)).casefold()
+        compact.setdefault(category, value)
+    if compact:
+        total = sum(compact.values())
+        if 1 <= total <= 16:
+            return total
+    return None
+
+
+def _anima_subject_group_ids(
+    text: str,
+    spans: List[Dict[str, Any]],
+    *,
+    subject_count: Optional[int],
+    enabled: bool,
+) -> List[int]:
+    """Choose PromptPlan groups that represent individual people/characters.
+
+    Existing AND/BREAK/semicolon groups remain valid semantic groups.  This
+    helper merely labels a conservative subset as *subject ownership* groups so
+    the native text encoder does not mistake style/background clauses for
+    characters.  Explicit ``subject N:`` and screen-position prefixes win;
+    exact-count prompts can also select the best character-like semicolon
+    clauses without changing the visible prompt text.
+    """
+    if not enabled or not spans:
+        return []
+    group_text: Dict[int, List[str]] = {}
+    for span in spans:
+        gid = int(span.get("group", 0))
+        a = max(0, int(span.get("start", 0)))
+        b = min(len(text), int(span.get("end", a)))
+        group_text.setdefault(gid, []).append(text[a:b])
+    scored: List[Tuple[int, int, bool]] = []
+    for gid, pieces in group_text.items():
+        clause = " ".join(pieces).strip()
+        lowered = clause.casefold()
+        explicit = bool(_ANIMA_SUBJECT_MARKER_RE.search(clause))
+        position = bool(_ANIMA_POSITION_MARKER_RE.search(clause))
+        label = bool(_ANIMA_LABEL_MARKER_RE.search(clause))
+        score = 0
+        if explicit:
+            score += 100
+        if position:
+            score += 30
+        if label:
+            score += 10
+        score += 3 * sum(1 for cue in _ANIMA_CHARACTER_CUES if cue in lowered)
+        score -= 3 * sum(1 for cue in _ANIMA_GLOBAL_CUES if cue in lowered)
+        scored.append((gid, score, explicit or position))
+
+    strong = [gid for gid, _score, is_strong in scored if is_strong]
+    if subject_count is None:
+        return sorted(dict.fromkeys(strong))
+
+    target = max(1, int(subject_count))
+    # Strong markers are always retained first. Fill the remaining expected
+    # character slots from the most character-like groups. Stable gid order is
+    # used as a tiebreaker to keep deterministic PromptPlans.
+    selected: List[int] = list(dict.fromkeys(strong))[:target]
+    remaining = sorted(
+        ((gid, score) for gid, score, _ in scored if gid not in selected),
+        key=lambda item: (-item[1], item[0]),
+    )
+    for gid, score in remaining:
+        if len(selected) >= target:
+            break
+        if score > 0:
+            selected.append(gid)
+
+    # Common structured form: a global prefix followed by exactly N semicolon
+    # character clauses.  If cue scoring was insufficient, prefer the trailing
+    # N groups rather than inventing additional subjects from the global prefix.
+    all_gids = sorted(group_text)
+    if len(selected) < target and len(all_gids) >= target:
+        for gid in all_gids[-target:]:
+            if gid not in selected:
+                selected.append(gid)
+            if len(selected) >= target:
+                break
+    return selected[:target]
+
+
 def _anima_build_prompt_plan(
     text: str,
     *,
@@ -4320,6 +4498,8 @@ def _anima_build_prompt_plan(
     weight_clamp_min: Optional[float],
     weight_clamp_max: Optional[float],
     semicolon_groups: bool = True,
+    auto_subject_groups: bool = True,
+    exact_subject_count: bool = True,
 ) -> Dict[str, Any]:
     """Convert sd_embed syntax into one full-text prompt memory plus span factors.
 
@@ -4395,18 +4575,37 @@ def _anima_build_prompt_plan(
     clean_text = "".join(clean_parts)
     if not clean_text:
         clean_text = " "
+    subject_count = _anima_extract_exact_subject_count(clean_text) if exact_subject_count else None
+    subject_group_ids = _anima_subject_group_ids(
+        clean_text,
+        spans,
+        subject_count=subject_count,
+        enabled=bool(auto_subject_groups),
+    )
+    color_intent = _anima_color_intent(clean_text)
+    calibration_bucket = _anima_calibration_bucket(clean_text, subject_count)
+    metadata: Dict[str, Any] = {
+        "source": "sd_embed",
+        "prompt_plan_version": 3,
+        "conditioning_mode": "single_qwen_memory",
+        "preserve_full_text": True,
+        "group_count": group_id + 1,
+        "and_folded_into_spans": bool(len(top_parts) > 1),
+        "semicolon_groups": bool(semicolon_groups),
+        "subject_binding_version": 2,
+        "subject_group_ids": subject_group_ids,
+        "auto_subject_groups": bool(auto_subject_groups),
+        "saturation_intent_version": 1,
+        "color_intent": color_intent,
+        "explicit_color_intent": color_intent != "neutral",
+        "calibration_bucket": calibration_bucket,
+    }
+    if subject_count is not None:
+        metadata["subject_count"] = int(subject_count)
     return {
         "text": clean_text,
         "spans": spans,
-        "metadata": {
-            "source": "sd_embed",
-            "prompt_plan_version": 2,
-            "conditioning_mode": "single_qwen_memory",
-            "preserve_full_text": True,
-            "group_count": group_id + 1,
-            "and_folded_into_spans": bool(len(top_parts) > 1),
-            "semicolon_groups": bool(semicolon_groups),
-        },
+        "metadata": metadata,
     }
 
 
@@ -4421,6 +4620,8 @@ def _anima_encode_prompt_plans_if_supported(
     weight_clamp_min: Optional[float],
     weight_clamp_max: Optional[float],
     semicolon_groups: bool = True,
+    auto_subject_groups: bool = True,
+    exact_subject_count: bool = True,
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
     encoder = getattr(pipe, "encode_prompt_plan", None)
     if not callable(encoder):
@@ -4434,6 +4635,8 @@ def _anima_encode_prompt_plans_if_supported(
             weight_clamp_min=weight_clamp_min,
             weight_clamp_max=weight_clamp_max,
             semicolon_groups=semicolon_groups,
+            auto_subject_groups=auto_subject_groups,
+            exact_subject_count=exact_subject_count,
         )
         for item in prompt_list
     ]
@@ -4446,6 +4649,8 @@ def _anima_encode_prompt_plans_if_supported(
             weight_clamp_min=weight_clamp_min,
             weight_clamp_max=weight_clamp_max,
             semicolon_groups=semicolon_groups,
+            auto_subject_groups=auto_subject_groups,
+            exact_subject_count=exact_subject_count,
         )
         for item in neg_list
     ]
@@ -4542,6 +4747,10 @@ def get_weighted_text_embeddings_anima(
     semantic_expansion_coherence_power: Optional[float] = None,
     semantic_expansion_min_coherence: Optional[float] = None,
     prompt_plan_semicolon_groups: bool = True,
+    # Native v2 subject binding. These only annotate PromptPlan ownership and do
+    # not rewrite, translate, or discard any user prompt text.
+    prompt_plan_auto_subject_groups: bool = True,
+    prompt_plan_exact_subject_count: bool = True,
     # Long prompt options (legacy fallback only)
     enable_long_prompt: bool = True,
     long_prompt_strategy: str = _ANIMA_LONG_PROMPT_FUSION_CHUNK_CONCAT,
@@ -4677,6 +4886,8 @@ def get_weighted_text_embeddings_anima(
                 weight_clamp_min=weight_clamp_min,
                 weight_clamp_max=weight_clamp_max,
                 semicolon_groups=bool(prompt_plan_semicolon_groups),
+                auto_subject_groups=bool(prompt_plan_auto_subject_groups),
+                exact_subject_count=bool(prompt_plan_exact_subject_count),
             )
             if planned is None:
                 raise RuntimeError(
