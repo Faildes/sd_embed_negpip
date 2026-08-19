@@ -76,3 +76,18 @@ def test_v6_prompt_plan_exposes_color_intent_and_calibration_bucket_metadata():
     ):
         assert marker in source
     ast.parse(source)
+
+
+def test_v7_full_source_preservation_and_prompt_adherence_metadata():
+    source = Path("src/sd_embed/embedding_funcs.py").read_text(encoding="utf-8")
+    for marker in (
+        '"prompt_plan_version": 5',
+        '"long_source_policy": "full_qwen_memory_fixed_512_queries"',
+        '"prompt_adherence_version": 1',
+        'def _anima_prompt_modality',
+        'def _anima_directive_density',
+        'there (?:is|are)',
+        'female|male',
+    ):
+        assert marker in source
+    ast.parse(source)

@@ -4323,6 +4323,9 @@ _ANIMA_COMPACT_GENDER_COUNT_RE = re.compile(
 _ANIMA_EXACT_COUNT_PATTERNS = (
     re.compile(r"(?i)\bexactly\s+(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|\d{1,2})\s+(?:girls?|boys?|women|men|people|persons?|characters?)\b"),
     re.compile(r"(?i)\b(?:a group of|group of)\s+(one|two|three|four|five|six|seven|eight|nine|ten|\d{1,2})\s+(?:girls?|boys?|women|men|people|persons?|characters?)\b"),
+    re.compile(r"(?i)\bthere (?:is|are) (?:exactly )?(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|\d{1,2})\s+(?:girls?|boys?|women|men|people|persons?|characters?)\b"),
+    re.compile(r"(?i)\b(?:a scene with|an image with|show|depict)\s+(?:exactly\s+)?(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|\d{1,2})\s+(?:girls?|boys?|women|men|people|persons?|characters?)\b"),
+    re.compile(r"(?i)\b(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|\d{1,2})\s+(?:female|male)\s+characters?\b"),
     re.compile(r"(?i)\b(?:duo|pair|couple)\b"),
     re.compile(r"(?i)\btrio\b"),
     re.compile(r"(?i)\bquartet\b"),
@@ -4336,7 +4339,9 @@ _ANIMA_SUBJECT_MARKER_RE = re.compile(
     r"(?i)^\s*(?:subject|character|char|person|woman|man|girl|boy)\s*(?:#?\d+|[A-H])\s*:"
 )
 _ANIMA_POSITION_MARKER_RE = re.compile(
-    r"(?i)^\s*(?:far\s+left|leftmost|left\b|center[- ]?left|centre[- ]?left|center\b|centre\b|center[- ]?right|centre[- ]?right|rightmost|far\s+right|right\b)"
+    r"(?i)^\s*(?:(?:the\s+)?(?:first|second|third|fourth|fifth|sixth|seventh|eighth)?\s*"
+    r"(?:girl|boy|woman|man|character|person)?\s*(?:on|at|from)?\s*(?:the\s+)?"
+    r"(?:far\s+left|leftmost|left\b|center[- ]?left|centre[- ]?left|center\b|centre\b|center[- ]?right|centre[- ]?right|rightmost|far\s+right|right\b))"
 )
 _ANIMA_LABEL_MARKER_RE = re.compile(r"^\s*[^,;:\n]{1,48}\s*:\s*\S")
 _ANIMA_CHARACTER_CUES = (
@@ -4365,6 +4370,32 @@ _ANIMA_COMPOSITION_BUCKET_RE = re.compile(
     r"close-up|full body|wide shot|panoramic|foreshortening|perspective|composition|foreground|"
     r"standing|sitting|kneeling|walking|running|jumping|crouching|contrapposto)\b"
 )
+
+def _anima_prompt_modality(text: str) -> str:
+    raw = str(text or "").strip()
+    if not raw:
+        return "empty"
+    has_sentence = bool(re.search(r"[.!?](?:\s|$)", raw)) or bool(
+        re.search(r"(?i)\b(?:there are|there is|the girl|the boy|the woman|the man|is wearing|wears|standing on|sitting on)\b", raw)
+    )
+    tag_like = raw.count(",") >= 3 or bool(re.search(r"(?i)(?:^|[,;]\s*)\d+(?:girls?|boys?)\b", raw))
+    structured = bool(re.search(r"(?i)\bsubject\s*#?\d+\s*:", raw))
+    if structured or (has_sentence and tag_like):
+        return "hybrid"
+    if has_sentence:
+        return "natural"
+    return "tags"
+
+
+def _anima_directive_density(text: str) -> int:
+    raw = str(text or "")
+    patterns = (
+        r"(?i)\bexactly\b", r"(?i)\bno additional people\b", r"(?i)\bno other (?:people|person|characters?)\b",
+        r"(?i)\b(?:left|right|center|centre|behind|in front of)\b", r"(?i)\b(?:wears|wearing|dress|jacket|coat|hoodie|uniform)\b",
+        r"(?i)\b(?:standing|sitting|kneeling|walking|running)\b", r"(?i)\bsubject\s*#?\d+\s*:",
+    )
+    return sum(len(re.findall(pattern, raw)) for pattern in patterns)
+
 
 def _anima_color_intent(text: str) -> str:
     raw = str(text or "")
@@ -4606,9 +4637,14 @@ def _anima_build_prompt_plan(
     calibration_bucket = _anima_calibration_bucket(clean_text, subject_count)
     metadata: Dict[str, Any] = {
         "source": "sd_embed",
-        "prompt_plan_version": 4,
+        "prompt_plan_version": 5,
         "conditioning_mode": "single_qwen_memory",
         "preserve_full_text": True,
+        "long_source_preservation_version": 1,
+        "long_source_policy": "full_qwen_memory_fixed_512_queries",
+        "prompt_adherence_version": 1,
+        "prompt_modality": _anima_prompt_modality(clean_text),
+        "directive_density": int(_anima_directive_density(clean_text)),
         "group_count": group_id + 1,
         "and_folded_into_spans": bool(len(top_parts) > 1),
         "semicolon_groups": bool(semicolon_groups),
@@ -4625,7 +4661,7 @@ def _anima_build_prompt_plan(
     }
     if subject_count is not None:
         metadata["subject_count"] = int(subject_count)
-        metadata["subject_count_source"] = "explicit_or_compact"
+        metadata["subject_count_source"] = "explicit_natural_multilingual_or_compact"
     return {
         "text": clean_text,
         "spans": spans,
