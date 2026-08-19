@@ -4323,6 +4323,11 @@ _ANIMA_COMPACT_GENDER_COUNT_RE = re.compile(
 _ANIMA_EXACT_COUNT_PATTERNS = (
     re.compile(r"(?i)\bexactly\s+(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|\d{1,2})\s+(?:girls?|boys?|women|men|people|persons?|characters?)\b"),
     re.compile(r"(?i)\b(?:a group of|group of)\s+(one|two|three|four|five|six|seven|eight|nine|ten|\d{1,2})\s+(?:girls?|boys?|women|men|people|persons?|characters?)\b"),
+    re.compile(r"(?i)\b(?:duo|pair|couple)\b"),
+    re.compile(r"(?i)\btrio\b"),
+    re.compile(r"(?i)\bquartet\b"),
+    re.compile(r"(?i)\bquintet\b"),
+    re.compile(r"(?i)\bsextet\b"),
     re.compile(r"(?<!\d)(\d{1,2})\s*人(?:の人物|物)?"),
     re.compile(r"(?<!\d)(\d{1,2})\s*(?:个|個)(?:人物|人)"),
     re.compile(r"(?<!\d)(\d{1,2})\s*명의\s*(?:인물|사람|여성|남성)"),
@@ -4396,8 +4401,23 @@ def _anima_extract_exact_subject_count(text: str) -> Optional[int]:
         match = pattern.search(raw)
         if match is None:
             continue
-        value = str(match.group(1)).lower()
-        count = int(value) if value.isdigit() else int(_ANIMA_EXACT_COUNT_WORDS.get(value, 0))
+        token = str(match.group(0)).casefold()
+        groups = match.groups()
+        raw_value = str(groups[0]).lower() if groups else ""
+        if raw_value:
+            count = int(raw_value) if raw_value.isdigit() else int(_ANIMA_EXACT_COUNT_WORDS.get(raw_value, 0))
+        elif token in {"duo", "pair", "couple"}:
+            count = 2
+        elif token == "trio":
+            count = 3
+        elif token == "quartet":
+            count = 4
+        elif token == "quintet":
+            count = 5
+        elif token == "sextet":
+            count = 6
+        else:
+            count = 0
         if 1 <= count <= 16:
             return count
     # Danbooru-style mixed groups such as ``2girls, 2boys`` describe four
@@ -4586,7 +4606,7 @@ def _anima_build_prompt_plan(
     calibration_bucket = _anima_calibration_bucket(clean_text, subject_count)
     metadata: Dict[str, Any] = {
         "source": "sd_embed",
-        "prompt_plan_version": 3,
+        "prompt_plan_version": 4,
         "conditioning_mode": "single_qwen_memory",
         "preserve_full_text": True,
         "group_count": group_id + 1,
@@ -4595,6 +4615,9 @@ def _anima_build_prompt_plan(
         "subject_binding_version": 2,
         "subject_group_ids": subject_group_ids,
         "auto_subject_groups": bool(auto_subject_groups),
+        "multi_person_anchor_version": 1,
+        "prefer_partial_qwen06_multi_person_anchor": bool(subject_count is not None and int(subject_count) >= 2),
+        "multi_person_prompt": bool(subject_count is not None and int(subject_count) >= 2),
         "saturation_intent_version": 1,
         "color_intent": color_intent,
         "explicit_color_intent": color_intent != "neutral",
@@ -4602,6 +4625,7 @@ def _anima_build_prompt_plan(
     }
     if subject_count is not None:
         metadata["subject_count"] = int(subject_count)
+        metadata["subject_count_source"] = "explicit_or_compact"
     return {
         "text": clean_text,
         "spans": spans,
