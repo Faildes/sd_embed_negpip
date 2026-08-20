@@ -62,3 +62,16 @@ uninstall_anima_artist_mixer(pipe)
 - The mixer is a transformer patch, so it must remain installed until the actual `pipe(...)` generation call finishes.
 - Call `uninstall_anima_artist_mixer(pipe)` after generation to restore the pipeline.
 - If your Diffusers Anima fork uses different block/cross-attention attribute names, edit `anima_artist_mixer_plus_diffusers.py` and customize `_default_get_blocks` / `_default_cross_attn_getter`.
+
+## TCAtria1B
+
+The Anima embedding path now unwraps the actual primary tokenizer from
+`AnimaPromptTokenizer` and resolves `transformer.llm_adapter` automatically.
+When the patched diffusers-anima pipeline reports `text_encoder_backend ==
+"tcatria1b"`, prompt weighting is therefore applied to the same Qwen3.5-tokenized
+source sequence that TCAtria1B receives.
+
+`pipe.text_encoder_max_sequence_length` controls the source-side length. The
+T5/final Anima conditioning remains capped at 512 tokens, so TCAtria1B can use a
+1024-token source context without changing Anima or Anima 2.9B transformer
+shapes.

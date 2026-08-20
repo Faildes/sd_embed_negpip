@@ -2027,6 +2027,45 @@ def _anima_get_component(pipe, names: List[str], *, required: bool = False):
     return None
 
 
+def _anima_primary_tokenizer(pipe):
+    """Return the real source tokenizer for stock Anima or TCAtria1B.
+
+    Custom diffusers-anima builds expose an ``AnimaPromptTokenizer`` wrapper.
+    Weighted prompt logic needs the underlying tokenizer so offset mappings line
+    up with the actual text encoder input.
+    """
+    tok = _anima_get_component(pipe, ["tokenizer", "prompt_tokenizer"], required=False)
+    if tok is None:
+        return None
+    return getattr(tok, "qwen_tokenizer", tok)
+
+
+def _anima_t5_tokenizer(pipe):
+    tok = _anima_get_component(pipe, ["t5_tokenizer", "target_tokenizer"], required=False)
+    if tok is not None:
+        return tok
+    wrapper = _anima_get_component(pipe, ["prompt_tokenizer"], required=False)
+    return getattr(wrapper, "t5_tokenizer", None) if wrapper is not None else None
+
+
+def _anima_llm_adapter(pipe):
+    adapter = _anima_get_component(pipe, ["llm_adapter", "adapter", "text_adapter"], required=False)
+    if adapter is not None:
+        return adapter
+    transformer = _anima_get_component(pipe, ["transformer"], required=False)
+    return getattr(transformer, "llm_adapter", None) if transformer is not None else None
+
+
+def _anima_source_max_length(pipe, fallback: int) -> int:
+    value = getattr(pipe, "text_encoder_max_sequence_length", None)
+    if value is None:
+        return int(fallback)
+    try:
+        return max(1, int(value))
+    except Exception:
+        return int(fallback)
+
+
 def _anima_get_device(pipe):
     for name in ("_execution_device", "execution_device", "_anima_execution_device", "device"):
         try:
@@ -2273,16 +2312,17 @@ def _anima_encode_direct_if_possible(
     Returns None for custom pipelines where the adapter is hidden/merged; callers then
     use encode_prompt + final-conditioning weighting.
     """
-    tokenizer = _anima_get_component(pipe, ["tokenizer", "prompt_tokenizer"], required=False)
-    t5_tokenizer = _anima_get_component(pipe, ["t5_tokenizer", "target_tokenizer"], required=False)
+    tokenizer = _anima_primary_tokenizer(pipe)
+    t5_tokenizer = _anima_t5_tokenizer(pipe)
     text_encoder = _anima_get_component(pipe, ["text_encoder"], required=False)
-    llm_adapter = _anima_get_component(pipe, ["llm_adapter", "adapter", "text_adapter"], required=False)
+    llm_adapter = _anima_llm_adapter(pipe)
 
     if tokenizer is None or t5_tokenizer is None or text_encoder is None or llm_adapter is None:
         return None
 
     device = _anima_get_device(pipe)
     dtype = _anima_get_dtype(pipe)
+    source_max_sequence_length = _anima_source_max_length(pipe, max_sequence_length)
 
     text = text or ""
     clean_text, _ = _strip_attention_syntax(text)
@@ -2299,7 +2339,7 @@ def _anima_encode_direct_if_possible(
     qwen_ids, qwen_weights, qwen_mask, _ = _token_weights_from_offsets(
         tokenizer,
         text,
-        max_sequence_length=max_sequence_length,
+        max_sequence_length=source_max_sequence_length,
     )
     t5_ids, t5_weights, _t5_mask, _ = _token_weights_from_offsets(
         t5_tokenizer,
@@ -2314,7 +2354,10 @@ def _anima_encode_direct_if_possible(
     t5_weight_tensor = torch.tensor([t5_weights], dtype=dtype, device=device)
 
     cache = getattr(pipe, "_sd_embed_anima_empty_cache", None)
-    cache_key = ("direct", id(tokenizer), id(t5_tokenizer), id(llm_adapter), str(device), str(dtype), int(max_sequence_length))
+    cache_key = (
+        "direct", type(text_encoder).__name__, id(tokenizer), id(t5_tokenizer), id(llm_adapter),
+        str(device), str(dtype), int(source_max_sequence_length), int(max_sequence_length)
+    )
     if cache is None:
         cache = {}
         setattr(pipe, "_sd_embed_anima_empty_cache", cache)
@@ -2324,7 +2367,7 @@ def _anima_encode_direct_if_possible(
             "",
             padding="max_length",
             truncation=True,
-            max_length=int(max_sequence_length),
+            max_length=int(source_max_sequence_length),
             return_tensors="pt",
         )
         empty_t5 = t5_tokenizer(
@@ -2402,7 +2445,9 @@ def _anima_encode_final_weighted(
     then applies ComfyUI-style token weighting directly to the final conditioning.
     It avoids pipe.tokenizer and llm_adapter entirely.
     """
-    tokenizer = _anima_get_component(pipe, ["tokenizer", "prompt_tokenizer"], required=True)
+    tokenizer = _anima_primary_tokenizer(pipe)
+    if tokenizer is None:
+        raise AttributeError("AnimaPipeline has no usable primary tokenizer")
     clean_text, _ = _strip_attention_syntax(text or "")
 
     base = _anima_encode_cond_only(
@@ -2646,6 +2691,14 @@ except Exception:  # pragma: no cover
     _sd_embed_contextmanager = None
 
 _ANIMA_QWEN3_DEFAULT_PAD_TOKEN_ID = 151643
+
+def _anima_v3_source_pad_id(tokenizer) -> int:
+    pad = getattr(tokenizer, "pad_token_id", None)
+    if pad is None:
+        pad = getattr(tokenizer, "eos_token_id", None)
+    if pad is None:
+        pad = _ANIMA_QWEN3_DEFAULT_PAD_TOKEN_ID
+    return int(pad)
 _ANIMA_CONDITIONING_MAX_LENGTH = 512
 
 # Anima's native helper commonly produces a 512-token conditioning window.
@@ -2947,9 +3000,7 @@ def _anima_v3_prepare_condition_inputs(
     text_encoder = _anima_get_component(pipe, ["text_encoder"], required=True)
     execution_device, model_dtype, text_encoder_dtype, enable_offload = _anima_v3_pipeline_runtime(pipe)
 
-    qwen_pad = getattr(qwen_tokenizer, "pad_token_id", None)
-    if qwen_pad is None:
-        qwen_pad = _ANIMA_QWEN3_DEFAULT_PAD_TOKEN_ID
+    qwen_pad = _anima_v3_source_pad_id(qwen_tokenizer)
     t5_pad = getattr(t5_tokenizer, "pad_token_id", None)
     if t5_pad is None:
         t5_pad = 0
@@ -2964,9 +3015,11 @@ def _anima_v3_prepare_condition_inputs(
     max_qwen_len = 0
     max_t5_len = 0
 
-    # Leave at least one slot for T5 eos if truncating.
-    qwen_trunc = int(max_sequence_length) if max_sequence_length and max_sequence_length > 0 else None
-    t5_trunc = int(max_sequence_length) if max_sequence_length and max_sequence_length > 0 else None
+    # TCAtria1B can preserve a longer source sequence than the 512-token
+    # Anima/T5 target conditioning. Stock Anima reports 512 here, while the
+    # patched TCAtria pipeline defaults to 1024.
+    qwen_trunc = _anima_source_max_length(pipe, int(max_sequence_length))
+    t5_trunc = min(int(max_sequence_length), _ANIMA_CONDITIONING_MAX_LENGTH) if max_sequence_length and max_sequence_length > 0 else _ANIMA_CONDITIONING_MAX_LENGTH
 
     for text in prompts:
         q_ids, q_weights, _clean_q, _has_q = _anima_v3_tokenize_with_weights(
@@ -3147,9 +3200,7 @@ def _anima_v3_prepare_condition_inputs_from_token_batches(
     text_encoder = _anima_get_component(pipe, ["text_encoder"], required=True)
     execution_device, model_dtype, text_encoder_dtype, enable_offload = _anima_v3_pipeline_runtime(pipe)
 
-    qwen_pad = getattr(qwen_tokenizer, "pad_token_id", None)
-    if qwen_pad is None:
-        qwen_pad = _ANIMA_QWEN3_DEFAULT_PAD_TOKEN_ID
+    qwen_pad = _anima_v3_source_pad_id(qwen_tokenizer)
     t5_pad = getattr(t5_tokenizer, "pad_token_id", None)
     if t5_pad is None:
         t5_pad = 0
@@ -3518,9 +3569,7 @@ def _anima_v3_encode_long_single(
     long_prompt_anchor_tokens: int,
 ) -> torch.Tensor:
     _prompt_tokenizer, qwen_tokenizer, t5_tokenizer = _anima_v3_get_prompt_tokenizer(pipe)
-    qwen_pad = getattr(qwen_tokenizer, "pad_token_id", None)
-    if qwen_pad is None:
-        qwen_pad = _ANIMA_QWEN3_DEFAULT_PAD_TOKEN_ID
+    qwen_pad = _anima_v3_source_pad_id(qwen_tokenizer)
     t5_eos = getattr(t5_tokenizer, "eos_token_id", None)
     if t5_eos is None:
         t5_eos = 1
@@ -3550,7 +3599,7 @@ def _anima_v3_encode_long_single(
         qwen_hidden, t5_ids, t5_weights = _anima_v3_prepare_condition_inputs(
             pipe,
             [text or ""],
-            max_sequence_length=chunk_size,
+            max_sequence_length=max_sequence_length,
             qwen_weight_strength=qwen_weight_strength,
             t5_weight_strength=adapter_weight_strength,
             weight_clamp_min=weight_clamp_min,
@@ -3580,7 +3629,7 @@ def _anima_v3_encode_long_single(
         qwen_hidden, t5_ids_t, t5_weights_t = _anima_v3_prepare_condition_inputs(
             pipe,
             [chunk_text or ""],
-            max_sequence_length=chunk_size,
+            max_sequence_length=max_sequence_length,
             qwen_weight_strength=qwen_weight_strength,
             t5_weight_strength=adapter_weight_strength,
             weight_clamp_min=weight_clamp_min,
@@ -4488,9 +4537,7 @@ def _anima_v3_pack_prompt_text_with_breaks(
     chunk_size: int,
     break_token: str = "BREAK",
 ) -> List[str]:
-    qwen_pad = getattr(qwen_tokenizer, "pad_token_id", None)
-    if qwen_pad is None:
-        qwen_pad = _ANIMA_QWEN3_DEFAULT_PAD_TOKEN_ID
+    qwen_pad = _anima_v3_source_pad_id(qwen_tokenizer)
     t5_eos = getattr(t5_tokenizer, "eos_token_id", None)
     if t5_eos is None:
         t5_eos = 1
@@ -4573,9 +4620,7 @@ def _anima_v3_encode_long_single(
     long_prompt_anchor_tokens: int,
 ) -> torch.Tensor:
     _prompt_tokenizer, qwen_tokenizer, t5_tokenizer = _anima_v3_get_prompt_tokenizer(pipe)
-    qwen_pad = getattr(qwen_tokenizer, "pad_token_id", None)
-    if qwen_pad is None:
-        qwen_pad = _ANIMA_QWEN3_DEFAULT_PAD_TOKEN_ID
+    qwen_pad = _anima_v3_source_pad_id(qwen_tokenizer)
     t5_eos = getattr(t5_tokenizer, "eos_token_id", None)
     if t5_eos is None:
         t5_eos = 1
@@ -4597,13 +4642,17 @@ def _anima_v3_encode_long_single(
         truncate_to=None,
     )
 
-    chunk_size = _anima_v3_long_prompt_chunk_size(max_sequence_length, long_prompt_chunk_size)
+    source_budget = _anima_source_max_length(pipe, max_sequence_length)
+    chunk_size = _anima_v3_long_prompt_chunk_size(source_budget, long_prompt_chunk_size)
 
-    if len(q_ids) <= chunk_size and len(t_ids) <= chunk_size:
+    # The T5 side may be longer than 512 in raw text; it is intentionally
+    # truncated to the native Anima target budget inside prepare_condition_inputs.
+    # TCAtria's longer source sequence is still visible to the cross-attention adapter.
+    if len(q_ids) <= chunk_size:
         qwen_hidden, t5_ids, t5_weights = _anima_v3_prepare_condition_inputs(
             pipe,
             [text or ""],
-            max_sequence_length=chunk_size,
+            max_sequence_length=max_sequence_length,
             qwen_weight_strength=qwen_weight_strength,
             t5_weight_strength=adapter_weight_strength,
             weight_clamp_min=weight_clamp_min,
@@ -4629,7 +4678,7 @@ def _anima_v3_encode_long_single(
         qwen_hidden, t5_ids_t, t5_weights_t = _anima_v3_prepare_condition_inputs(
             pipe,
             [chunk_text or ""],
-            max_sequence_length=chunk_size,
+            max_sequence_length=max_sequence_length,
             qwen_weight_strength=qwen_weight_strength,
             t5_weight_strength=adapter_weight_strength,
             weight_clamp_min=weight_clamp_min,
