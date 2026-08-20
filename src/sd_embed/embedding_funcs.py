@@ -3449,6 +3449,17 @@ def _anima_v3_align_pos_neg_conditions(pos: torch.Tensor, neg: torch.Tensor) -> 
     )
 
 
+def _anima_v8_preserve_independent_cfg_lengths(pipe) -> bool:
+    """Keep positive/negative null occupancy independent for v8 Anima.
+
+    The v8 transformer automatically switches CFG to split mode when the two
+    conditioning lengths differ. Padding the shorter branch here would change
+    its semantic/null ratio and partially undo the long-query stabilizer.
+    """
+    transformer = getattr(pipe, "transformer", None)
+    return bool(getattr(transformer, "t5_single_pass_full_stream", False))
+
+
 def _anima_v3_fuse_long_prompt_conditions(
     conditions: List[torch.Tensor],
     *,
@@ -4642,12 +4653,17 @@ def _anima_build_prompt_plan(
     calibration_bucket = _anima_calibration_bucket(clean_text, subject_count)
     metadata: Dict[str, Any] = {
         "source": "sd_embed",
-        "prompt_plan_version": 7,
-        "conditioning_mode": "single_qwen_memory",
+        "prompt_plan_version": 8,
+        "conditioning_mode": "single_qwen_memory_single_t5_stream",
         "preserve_full_text": True,
+        "preserve_full_t5_stream": True,
         "long_source_preservation_version": 1,
-        "long_source_policy": "full_qwen_memory_stable_query_anchors",
-        "t5_query_anchor_policy": "separator_subject_aware_v1",
+        "long_source_policy": "full_qwen_memory_full_t5_single_pass",
+        "t5_query_policy": "full_exact_token_stream_v1",
+        "t5_query_paging": False,
+        "t5_query_compression": False,
+        "t5_query_selection": False,
+        "conditioning_stability_policy": "null_occupancy_single_pass_v1",
         "separator_preservation_version": 2,
         "group_separator_types": {str(k): str(v) for k, v in group_separator_types.items()},
         "prompt_adherence_version": 2,
@@ -4963,7 +4979,8 @@ def get_weighted_text_embeddings_anima(
                     "Apply that patch, or explicitly set use_prompt_plan=False to use the legacy chunk/mix path."
                 )
             pos, neg = planned
-            pos, neg = _anima_v3_align_pos_neg_conditions(pos, neg)
+            if not _anima_v8_preserve_independent_cfg_lengths(pipe):
+                pos, neg = _anima_v3_align_pos_neg_conditions(pos, neg)
             if return_artist_mixer:
                 return pos, neg, mixer_obj
             return pos, neg

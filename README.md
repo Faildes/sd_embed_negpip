@@ -571,3 +571,14 @@ semantic rewriting or text-budget compression.
 ### Anima final encoder v3 + v4 stability
 
 When used with the matching diffusers-anima v4-over-v3 patch, the final Anima embedding helper can optionally tune the active v2 bridge or v3 final-encoder conditioner through `conditioning_*` keyword arguments. PromptPlan semicolons are soft binding boundaries by default (`prompt_plan_semicolon_groups=True`), which helps keep multi-character semantic expansion slots separate while preserving one Qwen source memory and one adapter pass.
+
+
+### Anima v8 full T5 single-pass conditioning
+
+With a matching diffusers-anima v8 runtime, the PromptPlan path preserves the
+complete Qwen source memory and the complete ordered T5 token/query stream. It
+does not chunk, page, uniformly sample, merge, or truncate T5 queries. Long
+query stability is handled inside the transformer with semantic-free null
+attention/conditioning slots. Positive and negative conditioning lengths are
+left independent so the pipeline can use split CFG without changing either
+branch's null occupancy.
