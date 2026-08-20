@@ -4642,7 +4642,7 @@ def _anima_build_prompt_plan(
     calibration_bucket = _anima_calibration_bucket(clean_text, subject_count)
     metadata: Dict[str, Any] = {
         "source": "sd_embed",
-        "prompt_plan_version": 6,
+        "prompt_plan_version": 7,
         "conditioning_mode": "single_qwen_memory",
         "preserve_full_text": True,
         "long_source_preservation_version": 1,
