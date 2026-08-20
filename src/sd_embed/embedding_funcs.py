@@ -4341,7 +4341,9 @@ _ANIMA_SUBJECT_MARKER_RE = re.compile(
 _ANIMA_POSITION_MARKER_RE = re.compile(
     r"(?i)^\s*(?:(?:the\s+)?(?:first|second|third|fourth|fifth|sixth|seventh|eighth)?\s*"
     r"(?:girl|boy|woman|man|character|person)?\s*(?:on|at|from)?\s*(?:the\s+)?"
-    r"(?:far\s+left|leftmost|left\b|center[- ]?left|centre[- ]?left|center\b|centre\b|center[- ]?right|centre[- ]?right|rightmost|far\s+right|right\b))"
+    r"(?:top[- ]?left|upper[- ]?left|top[- ]?right|upper[- ]?right|bottom[- ]?left|lower[- ]?left|"
+    r"bottom[- ]?right|lower[- ]?right|far\s+left|leftmost|left\b|center[- ]?left|centre[- ]?left|"
+    r"center\b|centre\b|center[- ]?right|centre[- ]?right|rightmost|far\s+right|right\b))"
 )
 _ANIMA_LABEL_MARKER_RE = re.compile(r"^\s*[^,;:\n]{1,48}\s*:\s*\S")
 _ANIMA_CHARACTER_CUES = (
@@ -4527,16 +4529,11 @@ def _anima_subject_group_ids(
         if score > 0:
             selected.append(gid)
 
-    # Common structured form: a global prefix followed by exactly N semicolon
-    # character clauses.  If cue scoring was insufficient, prefer the trailing
-    # N groups rather than inventing additional subjects from the global prefix.
-    all_gids = sorted(group_text)
-    if len(selected) < target and len(all_gids) >= target:
-        for gid in all_gids[-target:]:
-            if gid not in selected:
-                selected.append(gid)
-            if len(selected) >= target:
-                break
+    # v6 deliberately does *not* fill missing slots from arbitrary trailing
+    # groups. Long prompts often end in composition/style/background clauses;
+    # promoting those to subjects is a direct route to phantom people and
+    # cross-character attribute leakage. Exact count remains a separate global
+    # signal even when fewer ownership clauses can be identified safely.
     return selected[:target]
 
 
@@ -4565,6 +4562,11 @@ def _anima_build_prompt_plan(
     spans: List[Dict[str, Any]] = []
     cursor = 0
     group_id = 0
+    # Preserve the *kind* of every original semantic boundary. v5 retained
+    # group ids but folded AND/BREAK into generic visible separators; v6 keeps
+    # boundary provenance in metadata so the native encoder/query sampler can
+    # distinguish AND, BREAK, and semicolon boundaries without changing text.
+    group_separator_types: Dict[int, str] = {0: "root"}
 
     for part_index, part in enumerate(top_parts):
         segment_text, and_weight = _split_suffix_weight_top_level(part) if len(top_parts) > 1 else (part, 1.0)
@@ -4578,6 +4580,7 @@ def _anima_build_prompt_plan(
                     clean_parts.append("\n")
                     cursor += 1
                 group_id += 1
+                group_separator_types[group_id] = "break"
                 continue
 
             # v4 treats top-level semicolons as *soft* binding boundaries. The
@@ -4591,6 +4594,7 @@ def _anima_build_prompt_plan(
                     clean_parts.append(separator)
                     cursor += len(separator)
                     group_id += 1
+                    group_separator_types[group_id] = "semicolon"
                 if not subpiece:
                     continue
                 start = cursor
@@ -4620,6 +4624,7 @@ def _anima_build_prompt_plan(
             clean_parts.append(separator)
             cursor += len(separator)
             group_id += 1
+            group_separator_types[group_id] = "and"
 
     # Keep whitespace exactly as reconstructed so character-span offsets stay
     # valid. Tokenizers ignore/handle it naturally; no semantic text is dropped.
@@ -4637,18 +4642,21 @@ def _anima_build_prompt_plan(
     calibration_bucket = _anima_calibration_bucket(clean_text, subject_count)
     metadata: Dict[str, Any] = {
         "source": "sd_embed",
-        "prompt_plan_version": 5,
+        "prompt_plan_version": 6,
         "conditioning_mode": "single_qwen_memory",
         "preserve_full_text": True,
         "long_source_preservation_version": 1,
-        "long_source_policy": "full_qwen_memory_fixed_512_queries",
-        "prompt_adherence_version": 1,
+        "long_source_policy": "full_qwen_memory_stable_query_anchors",
+        "t5_query_anchor_policy": "separator_subject_aware_v1",
+        "separator_preservation_version": 2,
+        "group_separator_types": {str(k): str(v) for k, v in group_separator_types.items()},
+        "prompt_adherence_version": 2,
         "prompt_modality": _anima_prompt_modality(clean_text),
         "directive_density": int(_anima_directive_density(clean_text)),
         "group_count": group_id + 1,
         "and_folded_into_spans": bool(len(top_parts) > 1),
         "semicolon_groups": bool(semicolon_groups),
-        "subject_binding_version": 2,
+        "subject_binding_version": 3,
         "subject_group_ids": subject_group_ids,
         "auto_subject_groups": bool(auto_subject_groups),
         "multi_person_anchor_version": 1,
