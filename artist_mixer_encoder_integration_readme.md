@@ -61,4 +61,6 @@ uninstall_anima_artist_mixer(pipe)
 - Plain normal Anima artist tags such as `@artist` are not removed unless they use mixer syntax like `@artist:[style:0.7]` or `@artist:eyes:1.2`.
 - The mixer is a transformer patch, so it must remain installed until the actual `pipe(...)` generation call finishes.
 - Call `uninstall_anima_artist_mixer(pipe)` after generation to restore the pipeline.
+- On Anima 2.9B, the mixer targets the 28 inherited blocks and preserves all 12 newly trained expansion blocks.
+- `long_prompt_strategy="auto"` is the default. It uses `chunk_residual` on 2.9B to keep native 512-token conditioning and `chunk_concat` on base Anima. Pass an explicit strategy to override it.
 - If your Diffusers Anima fork uses different block/cross-attention attribute names, edit `anima_artist_mixer_plus_diffusers.py` and customize `_default_get_blocks` / `_default_cross_attn_getter`.

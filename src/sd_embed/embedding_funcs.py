@@ -2649,15 +2649,51 @@ _ANIMA_QWEN3_DEFAULT_PAD_TOKEN_ID = 151643
 _ANIMA_CONDITIONING_MAX_LENGTH = 512
 
 # Anima's native helper commonly produces a 512-token conditioning window.
-# The CLIP/SDXL-style long-prompt strategy implemented here preserves later
-# windows by concatenating native per-window conditions along the sequence
-# dimension instead of compressing them back into a single 512-token tensor.
-# Older fusion modes are still kept as fallbacks/comparison strategies.
+# The original 28-block implementation keeps the historical concatenation
+# behaviour. Anima 2.9B is more sensitive to out-of-distribution conditioning
+# lengths, so ``auto`` keeps its final condition at the native 512 tokens by
+# folding later chunks into a residual. Explicit modes remain available.
+_ANIMA_LONG_PROMPT_FUSION_AUTO = "auto"
 _ANIMA_LONG_PROMPT_FUSION_CHUNK_CONCAT = "chunk_concat"
 _ANIMA_LONG_PROMPT_FUSION_CHUNK_BLEND = "chunk_blend"
 _ANIMA_LONG_PROMPT_FUSION_CHUNK_SLOTS = "chunk_slots"
 _ANIMA_LONG_PROMPT_FUSION_CHUNK_RESIDUAL = "chunk_residual"
 _ANIMA_LONG_PROMPT_FUSION_TRUNCATE = "truncate"
+
+
+def _anima_v3_transformer_num_layers(pipe) -> Optional[int]:
+    transformer = getattr(pipe, "transformer", None)
+    config = getattr(transformer, "config", None)
+    configured = getattr(config, "num_layers", None)
+    if configured is None and hasattr(config, "get"):
+        configured = config.get("num_layers")
+    if configured is not None:
+        try:
+            depth = int(configured)
+        except (TypeError, ValueError):
+            depth = 0
+        if depth > 0:
+            return depth
+
+    core = getattr(transformer, "core", None)
+    for candidate in (core, transformer):
+        for name in ("transformer_blocks", "blocks"):
+            blocks = getattr(candidate, name, None)
+            if blocks is not None:
+                try:
+                    return int(len(blocks))
+                except TypeError:
+                    pass
+    return None
+
+
+def _anima_v3_resolve_long_prompt_strategy(pipe, strategy: str) -> str:
+    normalized = str(strategy or _ANIMA_LONG_PROMPT_FUSION_AUTO).lower()
+    if normalized != _ANIMA_LONG_PROMPT_FUSION_AUTO:
+        return normalized
+    if _anima_v3_transformer_num_layers(pipe) == 40:
+        return _ANIMA_LONG_PROMPT_FUSION_CHUNK_RESIDUAL
+    return _ANIMA_LONG_PROMPT_FUSION_CHUNK_CONCAT
 
 
 def _anima_v3_flatten_ids(value) -> List[int]:
@@ -3655,12 +3691,15 @@ def _anima_v3_encode_batch(
     weight_clamp_min: Optional[float],
     weight_clamp_max: Optional[float],
     enable_long_prompt: bool = True,
-    long_prompt_strategy: str = _ANIMA_LONG_PROMPT_FUSION_CHUNK_CONCAT,
+    long_prompt_strategy: str = _ANIMA_LONG_PROMPT_FUSION_AUTO,
     long_prompt_chunk_size: Optional[int] = None,
     long_prompt_chunk_decay: float = 1.0,
     long_prompt_strength: float = 1.0,
     long_prompt_anchor_tokens: int = 160,
 ) -> torch.Tensor:
+    long_prompt_strategy = _anima_v3_resolve_long_prompt_strategy(
+        pipe, long_prompt_strategy
+    )
     if not enable_long_prompt or str(long_prompt_strategy).lower() == _ANIMA_LONG_PROMPT_FUSION_TRUNCATE:
         qwen_hidden, t5_ids, t5_weights = _anima_v3_prepare_condition_inputs(
             pipe,
@@ -3878,7 +3917,7 @@ def get_weighted_text_embeddings_anima(
     and_strength: float = 0.60,
     base_bias: float = 4.0,
     enable_long_prompt: bool = True,
-    long_prompt_strategy: str = _ANIMA_LONG_PROMPT_FUSION_CHUNK_CONCAT,
+    long_prompt_strategy: str = _ANIMA_LONG_PROMPT_FUSION_AUTO,
     long_prompt_chunk_size: Optional[int] = None,
     long_prompt_chunk_decay: float = 1.0,
     long_prompt_strength: float = 1.0,
@@ -4256,7 +4295,7 @@ def get_weighted_text_embeddings_anima(
     base_bias: float = 4.0,
     # Long prompt options
     enable_long_prompt: bool = True,
-    long_prompt_strategy: str = _ANIMA_LONG_PROMPT_FUSION_CHUNK_CONCAT,
+    long_prompt_strategy: str = _ANIMA_LONG_PROMPT_FUSION_AUTO,
     long_prompt_chunk_size: Optional[int] = None,
     long_prompt_chunk_decay: float = 1.0,
     long_prompt_strength: float = 1.0,

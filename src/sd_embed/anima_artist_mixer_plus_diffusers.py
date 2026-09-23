@@ -8,11 +8,13 @@ This file implements the same high-level syntax as the ComfyUI node:
     @artist:[style:1.0, face:0.4, eyes pose:0.7]
 
 It patches Anima/MiniTrainDIT cross-attention modules and routes every artist to
-the active Anima transformer depth according to the requested component. The
-original 28-block layout and the expanded 40-block Anima 2.9B layout are mapped
-semantically so inserted blocks inherit the role of their source block. The script
-is designed as a safe adapter: if your Diffusers Anima implementation uses different
-module names, pass custom `blocks_getter` / `cross_attn_getter` callbacks.
+the active Anima transformer depth according to the requested component. For the
+expanded 40-block Anima 2.9B layout, routing follows the 28 inherited blocks and
+leaves the twelve newly trained expansion blocks untouched. This avoids applying
+the same intervention 43 percent more often than on the base model and preserves
+the behaviour learned specifically by the 2.9B expansion. The script is designed
+as a safe adapter: if your Diffusers Anima implementation uses different module
+names, pass custom `blocks_getter` / `cross_attn_getter` callbacks.
 
 Important: non-cross-attention elements are not directly re-encoded in this
 Diffusers version. Artist text affects the model through per-layer cross-attn
@@ -88,9 +90,18 @@ _BASE_COMPONENT_LAYER_MAP: Dict[str, Dict[int, float]] = {
 }
 
 
-# Anima 2.9B expands the original 28 main blocks to 40. The inserted blocks are
-# derived from the source blocks listed in expanded_manifest, so component
-# routing inherits the source block's semantic weight instead of stopping at L27.
+# Anima 2.9B expands the original 28 main blocks to 40. These are the measured
+# locations of the bit-identical inherited base blocks in the expanded network.
+# Artist Mixer targets only these inherited blocks by default: the inserted
+# blocks are the part trained for the 2.9B preview and should remain undisturbed.
+_ANIMA_29B_BASE_TO_EXPANDED: Tuple[int, ...] = (
+    0, 1, 3, 4, 6, 7, 9, 10, 12, 13, 15, 16, 18, 19,
+    20, 22, 23, 25, 26, 28, 29, 31, 32, 34, 35, 37, 38, 39,
+)
+
+
+# Kept as architecture metadata for integrations that need the expansion
+# manifest. It is intentionally not used to route Artist Mixer interventions.
 _ANIMA_29B_INSERTED_TO_SOURCE: Dict[int, int] = {
     2: 1, 5: 3, 8: 5, 11: 7, 14: 9, 17: 11,
     21: 14, 24: 16, 27: 18, 30: 20, 33: 22, 36: 24,
@@ -122,7 +133,10 @@ def _component_layer_map_for_depth(num_blocks: int) -> Dict[str, Dict[int, float
         return _BASE_COMPONENT_LAYER_MAP
 
     if num_blocks == 40:
-        source_for_block = _ANIMA_29B_SOURCE_FOR_BLOCK
+        source_for_block = {
+            expanded_index: base_index
+            for base_index, expanded_index in enumerate(_ANIMA_29B_BASE_TO_EXPANDED)
+        }
     else:
         # Future-compatible fallback: preserve relative depth roles rather than
         # silently leaving all blocks above L27 inactive.

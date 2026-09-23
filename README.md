@@ -2,7 +2,7 @@
 
 ## Anima architecture compatibility
 
-The Anima integration supports both the original 28-block Diffusers-Anima transformer and the expanded 40-block Anima 2.9B architecture. Artist Mixer routing automatically follows `transformer.core.transformer_blocks`; for Anima 2.9B, inserted blocks inherit the semantic component weights of their source blocks instead of being ignored above L27.
+The Anima integration supports both the original 28-block Diffusers-Anima transformer and the expanded 40-block Anima 2.9B architecture. On Anima 2.9B, Artist Mixer is mapped to the 28 inherited base blocks and leaves the twelve newly trained expansion blocks untouched. The default long-prompt strategy is architecture-aware: base Anima keeps sequence concatenation, while 2.9B folds later chunks into a native-length 512-token residual condition. Both choices can still be overridden explicitly.
 
 
 - [Stable Diffusion Long Prompt Weighted Embedding](#stable-diffusion-long-prompt-weighted-embedding)
