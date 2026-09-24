@@ -381,6 +381,29 @@ class DiffusersCrossAttnMixerWrapper(nn.Module):
         self.state = state
         self.layer_idx = int(layer_idx)
 
+    def _artist_contexts_for(self, context: torch.Tensor) -> List[torch.Tensor]:
+        """Reuse converted artist contexts across blocks and denoising steps.
+
+        The cache lives in the shared mixer state, so 28- and 40-block models
+        both transfer each artist tensor at most once per device/dtype/batch.
+        Keep the autograd path uncached for callers that train through the mixer.
+        """
+        artist_contexts: List[torch.Tensor] = self.state["artist_contexts"]
+        batch_size = context.shape[0]
+        if torch.is_grad_enabled() and any(t.requires_grad for t in artist_contexts):
+            return [
+                _broadcast_batch(t.to(device=context.device, dtype=context.dtype), batch_size)
+                for t in artist_contexts
+            ]
+        key = (context.device, context.dtype, batch_size)
+        cache = self.state.setdefault("_runtime_context_cache", {})
+        if key not in cache:
+            cache[key] = [
+                _broadcast_batch(t.to(device=context.device, dtype=context.dtype), batch_size)
+                for t in artist_contexts
+            ]
+        return cache[key]
+
     def _get_context(self, args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> Tuple[Optional[torch.Tensor], str, int]:
         for key in ("encoder_hidden_states", "context", "encoder_states"):
             v = kwargs.get(key)
@@ -416,16 +439,13 @@ class DiffusersCrossAttnMixerWrapper(nn.Module):
         if not torch.is_tensor(base):
             return base_raw
 
-        artist_contexts: List[torch.Tensor] = self.state["artist_contexts"]
         if self.state.get("normalize_weights", True):
             ws = _normalize_weights(weights)
         else:
             ws = list(weights)
 
         outs: List[torch.Tensor] = []
-        bsz = context.shape[0]
-        for ctx in artist_contexts:
-            ctx_b = _broadcast_batch(ctx.to(device=context.device, dtype=context.dtype), bsz)
+        for ctx_b in self._artist_contexts_for(context):
             out_raw = self._call_with_context(args, kwargs, key, pos, ctx_b)
             out = out_raw[0] if isinstance(out_raw, (tuple, list)) and torch.is_tensor(out_raw[0]) else out_raw
             if torch.is_tensor(out):
@@ -597,6 +617,7 @@ class DiffusersAnimaArtistMixer:
         self.state = {
             "enabled": True,
             "artist_contexts": contexts,
+            "_runtime_context_cache": {},
             "component_specs": specs,
             "layer_artist_weights": weights,
             "strength": float(strength),

@@ -3666,7 +3666,11 @@ def _anima_v3_build_condition(
         transformer,
         execution_device=execution_device,
         execution_dtype=model_dtype,
-        enable_offload=enable_offload,
+        # The pipeline's staging mode uses module CPU offload for Qwen/VAE,
+        # but keeps the transformer on the accelerator for denoising.
+        enable_offload=enable_offload and not bool(
+            getattr(pipe, "keep_transformer_on_device", False)
+        ),
     ):
         with torch.inference_mode():
             cond = transformer.preprocess_text_embeds(

@@ -60,6 +60,7 @@ uninstall_anima_artist_mixer(pipe)
 - `enable_artist_mixer=True` extracts top-level mixer syntax from the positive prompt before normal Anima text encoding.
 - Plain normal Anima artist tags such as `@artist` are not removed unless they use mixer syntax like `@artist:[style:0.7]` or `@artist:eyes:1.2`.
 - The mixer is a transformer patch, so it must remain installed until the actual `pipe(...)` generation call finishes.
+- Artist conditioning is converted and broadcast once per device, dtype and batch size, then shared by the active mixer blocks. Reinstalling or uninstalling the mixer clears this cache. It does not alter cross-attention arithmetic. SD_Embed supplies embeddings and this optional mixer; the Diffusers-Anima pipeline controls model placement, samplers and VAE decoding.
 - Call `uninstall_anima_artist_mixer(pipe)` after generation to restore the pipeline.
 - On Anima 2.9B, the mixer targets the 28 inherited blocks and preserves all 12 newly trained expansion blocks.
 - `long_prompt_strategy="auto"` is the default. It uses `chunk_residual` on 2.9B to keep native 512-token conditioning and `chunk_concat` on base Anima. Pass an explicit strategy to override it.
